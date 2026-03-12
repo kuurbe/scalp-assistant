@@ -24,11 +24,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
-from signals.notifier import send_telegram
+from signals.notifier import send_telegram, send_telegram_photo
 from signals.recommendation import get_recommendation
 from config import settings
-from analysis.ml_confidence import compute_ml_confidence, get_confidence_tier
+from analysis.ml_confidence import compute_ml_confidence, get_confidence_tier, log_training_sample
 from analysis.position_sizer import format_position_line
+from signals.chart_generator import generate_alert_chart, generate_summary_chart
 
 logging.basicConfig(
     level=logging.INFO,
@@ -238,6 +239,7 @@ def scan_asset_class(asset_class: str) -> dict:
         'option_puts': [formatted_str, ...],
         'day_trades': [formatted_str, ...],
         'swings': [formatted_str, ...],
+        'top_picks': [(ticker, score, pct_change, pick), ...],
     }
     """
     from dashboard.data_bridge import scan_universe
@@ -247,20 +249,23 @@ def scan_asset_class(asset_class: str) -> dict:
         picks = scan_universe(asset_class)
     except Exception as e:
         log.error("Failed to scan %s: %s", asset_class, e)
-        return {"option_calls": [], "option_puts": [], "day_trades": [], "swings": []}
+        return {"option_calls": [], "option_puts": [], "day_trades": [], "swings": [], "top_picks": []}
 
     if not picks:
         log.info("  No results for %s", asset_class)
-        return {"option_calls": [], "option_puts": [], "day_trades": [], "swings": []}
+        return {"option_calls": [], "option_puts": [], "day_trades": [], "swings": [], "top_picks": []}
 
     log.info("  %d tickers scored for %s", len(picks), asset_class)
 
-    results = {"option_calls": [], "option_puts": [], "day_trades": [], "swings": []}
+    results = {"option_calls": [], "option_puts": [], "day_trades": [], "swings": [], "top_picks": []}
 
     for pick in picks:
         try:
             rec = get_recommendation(pick)
             types = classify_setup(pick, rec)
+
+            # Log for ML training (features logged now, outcome backfilled later)
+            log_training_sample(pick)
 
             for t in types:
                 if t == "option_call":
@@ -271,6 +276,12 @@ def scan_asset_class(asset_class: str) -> dict:
                     results["day_trades"].append(_format_day_trade(pick, rec))
                 elif t == "swing":
                     results["swings"].append(_format_swing_trade(pick, rec))
+
+            # Track top picks for summary chart
+            if types:
+                results["top_picks"].append((
+                    pick.ticker, pick.composite_score, pick.pct_change, pick
+                ))
         except Exception as e:
             log.warning("  Error processing %s: %s", getattr(pick, "ticker", "?"), e)
 
@@ -287,12 +298,13 @@ def run_full_scan(asset_classes: list = None) -> None:
         "option_puts": [],
         "day_trades": [],
         "swings": [],
+        "top_picks": [],
     }
 
     for ac in asset_classes:
         results = scan_asset_class(ac)
         for key in all_results:
-            all_results[key].extend(results[key])
+            all_results[key].extend(results.get(key, []))
 
     # Build and send Telegram messages by category
     _dispatch_alerts(all_results)
@@ -344,7 +356,7 @@ def _dispatch_alerts(results: dict) -> None:
         send_telegram(msg)
         log.info("Sent %d swing trade alerts", len(swings))
 
-    # ── Summary ──
+    # ── Summary with chart ──
     summary = (
         f"{_header()}\n\n"
         f"<b>📊 SCAN SUMMARY</b>\n"
@@ -352,7 +364,21 @@ def _dispatch_alerts(results: dict) -> None:
         f"   Day Trades: {len(days)}  |  Swings: {len(swings)}\n"
         f"   Total Setups: {total}"
     )
-    send_telegram(summary)
+
+    # Try to send summary chart
+    top_picks = results.get("top_picks", [])
+    if top_picks:
+        # Sort by score, take top 10 for chart
+        top_picks.sort(key=lambda x: x[1], reverse=True)
+        chart_data = [(t[0], t[1], t[2]) for t in top_picks[:10]]
+        chart_bytes = generate_summary_chart(chart_data)
+        if chart_bytes:
+            send_telegram_photo(chart_bytes, caption=summary)
+            log.info("Sent summary with chart (%d top picks)", len(chart_data))
+        else:
+            send_telegram(summary)
+    else:
+        send_telegram(summary)
 
 
 # ─────────────────────────────────────────────────────────────

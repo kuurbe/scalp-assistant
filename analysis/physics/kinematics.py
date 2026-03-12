@@ -237,3 +237,146 @@ def compute_kinetic_energy(prices: pd.Series, volumes: pd.Series = None, decay_b
         }
     except Exception:
         return {"kinetic_energy": 0.0, "momentum": 0.0, "energy_score": 0.0, "acceleration": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# Physics v2.0 — Multi-timeframe energy + momentum divergence
+# ---------------------------------------------------------------------------
+
+def compute_physics_v2(prices: pd.Series, volumes: pd.Series = None) -> dict:
+    """
+    Advanced physics scoring v2.0:
+    1. Multi-timeframe kinetic energy (fast 5-bar + slow 20-bar)
+    2. Energy acceleration (rate of change of KE — catches explosive moves)
+    3. Momentum divergence (price vs volume-weighted momentum)
+    4. Jerk energy (3rd derivative power — detects regime transitions)
+    5. Energy regime classification (EXPLOSIVE, BUILDING, FADING, DORMANT)
+
+    Returns dict with all v2 metrics + energy_v2_score (0-100).
+    """
+    try:
+        prices = prices.astype(float).dropna()
+        if len(prices) < 20:
+            return _empty_v2()
+
+        if volumes is not None and len(volumes) == len(prices):
+            vol = volumes.astype(float).fillna(0)
+            mass = vol.rolling(10, min_periods=1).mean()
+            mass = mass.clip(lower=1.0)
+        else:
+            mass = pd.Series(1.0, index=prices.index)
+            vol = mass.copy()
+
+        # ── Multi-timeframe velocity ──
+        vel_fast = prices.pct_change(periods=5) * 100   # 5-bar (fast scalp)
+        vel_slow = prices.pct_change(periods=20) * 100  # 20-bar (swing context)
+
+        # ── Multi-timeframe KE ──
+        ke_fast = 0.5 * mass * (vel_fast ** 2)
+        ke_slow = 0.5 * mass * (vel_slow ** 2)
+
+        # Apply half-life decay
+        n = len(prices)
+        decay_fast = np.exp(-np.log(2) * np.arange(n)[::-1] / 10)
+        decay_slow = np.exp(-np.log(2) * np.arange(n)[::-1] / 30)
+        ke_fast_d = ke_fast * decay_fast
+        ke_slow_d = ke_slow * decay_slow
+
+        # ── Energy acceleration (dKE/dt — catches explosive builds) ──
+        energy_accel = ke_fast_d.diff(3).fillna(0)
+
+        # ── Momentum p = m * v (volume-weighted) ──
+        momentum_fast = mass * vel_fast
+        momentum_slow = mass * vel_slow
+
+        # ── Momentum divergence (fast vs slow) ──
+        # Positive = fast momentum pulling ahead (breakout forming)
+        # Negative = fast fading while slow holds (exhaustion)
+        mom_fast_norm = momentum_fast / momentum_fast.rolling(20, min_periods=1).std().clip(lower=1e-10)
+        mom_slow_norm = momentum_slow / momentum_slow.rolling(20, min_periods=1).std().clip(lower=1e-10)
+        mom_divergence = (mom_fast_norm - mom_slow_norm).fillna(0)
+
+        # ── Jerk energy (3rd derivative — regime transition detector) ──
+        accel = vel_fast.diff()
+        jerk = accel.diff()
+        jerk_energy = (0.5 * mass * (jerk ** 2)).fillna(0)
+
+        # ── Volume surge factor ──
+        vol_ratio = 1.0
+        if vol.mean() > 0:
+            vol_ratio = float(vol.iloc[-1] / vol.mean())
+            vol_ratio = min(max(vol_ratio, 0.3), 5.0)
+
+        # ── Latest values ──
+        def safe_last(s):
+            v = float(s.iloc[-1]) if len(s) > 0 else 0.0
+            return 0.0 if np.isnan(v) or np.isinf(v) else v
+
+        ke_fast_now = safe_last(ke_fast_d)
+        ke_slow_now = safe_last(ke_slow_d)
+        ke_fast_avg = float(ke_fast_d.mean()) if not np.isnan(ke_fast_d.mean()) else 1.0
+        energy_accel_now = safe_last(energy_accel)
+        mom_div_now = safe_last(mom_divergence)
+        jerk_e_now = safe_last(jerk_energy)
+        jerk_e_avg = float(jerk_energy.mean()) if not np.isnan(jerk_energy.mean()) else 1.0
+
+        # ── Energy regime classification ──
+        ke_ratio = ke_fast_now / max(ke_fast_avg, 1e-10)
+        if ke_ratio > 3.0 and energy_accel_now > 0 and vol_ratio > 1.5:
+            energy_regime = "EXPLOSIVE"
+        elif ke_ratio > 1.5 and energy_accel_now > 0:
+            energy_regime = "BUILDING"
+        elif ke_ratio > 0.5 and energy_accel_now < 0:
+            energy_regime = "FADING"
+        else:
+            energy_regime = "DORMANT"
+
+        # ── Composite v2 score (0-100) ──
+        # Energy ratio: how much current KE exceeds average
+        energy_score = float(np.clip(ke_ratio * 20, 0, 40))  # max 40 pts
+
+        # Energy acceleration bonus (explosive move forming)
+        accel_norm = energy_accel_now / max(ke_fast_avg, 1e-10)
+        accel_score = float(np.clip(accel_norm * 15, -10, 20))  # max 20 pts
+
+        # Momentum divergence (fast pulling ahead = good)
+        div_score = float(np.clip(mom_div_now * 5, -10, 15))  # max 15 pts
+
+        # Jerk spike (regime transition underway)
+        jerk_ratio = jerk_e_now / max(jerk_e_avg, 1e-10)
+        jerk_score = float(np.clip(jerk_ratio * 3, 0, 10))  # max 10 pts
+
+        # Volume confirmation
+        vol_score = float(np.clip((vol_ratio - 1.0) * 10, -5, 15))  # max 15 pts
+
+        raw = 50 + energy_score + accel_score + div_score + jerk_score + vol_score
+        energy_v2_score = float(np.clip(raw, 0, 100))
+
+        return {
+            "energy_v2_score": round(energy_v2_score, 1),
+            "energy_regime": energy_regime,
+            "ke_fast": round(ke_fast_now, 4),
+            "ke_slow": round(ke_slow_now, 4),
+            "ke_ratio": round(ke_ratio, 2),
+            "energy_accel": round(energy_accel_now, 4),
+            "momentum_divergence": round(mom_div_now, 2),
+            "jerk_energy": round(jerk_e_now, 4),
+            "vol_surge": round(vol_ratio, 2),
+        }
+
+    except Exception:
+        return _empty_v2()
+
+
+def _empty_v2() -> dict:
+    return {
+        "energy_v2_score": 0.0,
+        "energy_regime": "DORMANT",
+        "ke_fast": 0.0,
+        "ke_slow": 0.0,
+        "ke_ratio": 0.0,
+        "energy_accel": 0.0,
+        "momentum_divergence": 0.0,
+        "jerk_energy": 0.0,
+        "vol_surge": 0.0,
+    }
