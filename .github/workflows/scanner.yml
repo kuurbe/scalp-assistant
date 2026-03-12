@@ -1,0 +1,60 @@
+name: Scalp Assistant Scanner
+
+on:
+  schedule:
+    # Market hours (ET): Mon-Fri
+    # Pre-market scan: 9:00 AM ET (14:00 UTC)
+    - cron: '0 14 * * 1-5'
+    # Mid-morning scan: 10:30 AM ET (15:30 UTC)
+    - cron: '30 15 * * 1-5'
+    # Midday scan: 12:30 PM ET (17:30 UTC)
+    - cron: '30 17 * * 1-5'
+    # Power hour scan: 3:00 PM ET (20:00 UTC)
+    - cron: '0 20 * * 1-5'
+    # After hours scan: 4:30 PM ET (21:30 UTC)
+    - cron: '30 21 * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      asset_class:
+        description: 'Asset class to scan (stocks, etfs, crypto, or all)'
+        required: false
+        default: 'all'
+      test_mode:
+        description: 'Send test alerts instead of scanning'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
+          FRED_KEY: ${{ secrets.FRED_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
+            python -m scripts.scan_and_alert --test
+          elif [ "${{ github.event.inputs.asset_class }}" = "all" ] || [ -z "${{ github.event.inputs.asset_class }}" ]; then
+            python -m scripts.scan_and_alert
+          else
+            python -m scripts.scan_and_alert --asset "${{ github.event.inputs.asset_class }}"
+          fi
