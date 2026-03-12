@@ -170,6 +170,9 @@ def _analyze_ticker(ticker: str, macro_regime: str, reddit_data: dict, short_dat
             0.15 * kalman_score
         )
 
+        # ML prediction score
+        ml_score = _ml_analysis(ticker, daily)
+
         # Social intelligence analysis
         social_score_val, social_info = _social_analysis(
             ticker, political_pulse, war_watch, influencer_pulse
@@ -182,6 +185,7 @@ def _analyze_ticker(ticker: str, macro_regime: str, reddit_data: dict, short_dat
             catalyst_score=cat_score_val,
             statistical_score=stat_score,
             social_score=social_score_val,
+            ml_score=ml_score,
             macro_regime=macro_regime,
             regime_info=regime_info,
             kinematic_phase=kinematic_phase,
@@ -509,6 +513,15 @@ def _kalman_analysis(close) -> float:
         return get_kalman_score(close)
     except Exception:
         return 50
+
+
+def _ml_analysis(ticker: str, daily) -> float:
+    """Run ML prediction model and return 0-100 score."""
+    try:
+        from analysis.ml.predictor import get_ml_score
+        return get_ml_score(ticker, df=daily)
+    except Exception:
+        return 50.0
 
 
 def _social_analysis(ticker: str, political_pulse: dict = None,

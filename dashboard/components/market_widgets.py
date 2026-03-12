@@ -296,11 +296,13 @@ def fetch_gainers_losers() -> tuple[list[dict], list[dict]]:
                     sym_data = data
 
                 if sym_data is not None and len(sym_data) >= 2:
+                    import math
                     close = float(sym_data["Close"].iloc[-1])
                     prev = float(sym_data["Close"].iloc[-2])
-                    if prev > 0:
+                    if prev > 0 and not math.isnan(close) and not math.isnan(prev):
                         pct = ((close - prev) / prev) * 100
-                        all_data.append({"symbol": sym, "price": round(close, 2), "change_pct": round(pct, 2)})
+                        if not math.isnan(pct):
+                            all_data.append({"symbol": sym, "price": round(close, 2), "change_pct": round(pct, 2)})
             except Exception:
                 pass
 

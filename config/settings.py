@@ -169,11 +169,12 @@ def get_universe(asset_class: str) -> list:
 # ─────────────────────────────────────────────────────────────
 #  COMPOSITE SCORING WEIGHTS (must sum to 1.0)
 # ─────────────────────────────────────────────────────────────
-WEIGHT_PHYSICS = 0.25
-WEIGHT_TECHNICAL = 0.22
-WEIGHT_CATALYST = 0.20
-WEIGHT_STATISTICAL = 0.18
-# WEIGHT_SOCIAL = 0.15 (defined below in Social Intelligence section)
+WEIGHT_PHYSICS = 0.22
+WEIGHT_TECHNICAL = 0.20
+WEIGHT_CATALYST = 0.18
+WEIGHT_STATISTICAL = 0.16
+WEIGHT_ML = 0.12
+# WEIGHT_SOCIAL = 0.12 (defined below in Social Intelligence section)
 
 # ─────────────────────────────────────────────────────────────
 #  REGIME THRESHOLDS
@@ -234,7 +235,7 @@ OPTION_TARGET_PCT = 75            # target +75% gain
 # Composite scoring weight allocation (reallocated to include social)
 # Original: Physics 0.30, Technical 0.25, Catalyst 0.25, Statistical 0.20
 # Updated:  Physics 0.25, Technical 0.22, Catalyst 0.20, Statistical 0.18, Social 0.15
-WEIGHT_SOCIAL = 0.15
+WEIGHT_SOCIAL = 0.12
 
 # Social score sub-weights (within the 15% social allocation)
 SOCIAL_WEIGHT_STOCKTWITS = 0.30

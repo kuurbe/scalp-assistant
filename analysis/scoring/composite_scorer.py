@@ -24,6 +24,7 @@ class ScoredTicker:
     catalyst_score: float = 0
     statistical_score: float = 0
     social_score: float = 0
+    ml_score: float = 0
     # Social intel context
     political_exposure: str = ""
     war_exposure: str = ""
@@ -68,6 +69,7 @@ def score_ticker(
     catalyst_score: float = 0,
     statistical_score: float = 0,
     social_score: float = 0,
+    ml_score: float = 0,
     macro_regime: str = "NEUTRAL",
     regime_info: dict = None,
     kinematic_phase: str = "UNKNOWN",
@@ -82,14 +84,16 @@ def score_ticker(
     """
     Compute the final composite score and build a ScoredTicker.
     """
-    # Weighted composite (now includes social)
-    social_weight = getattr(settings, "WEIGHT_SOCIAL", 0.15)
+    # Weighted composite (includes social + ML)
+    social_weight = getattr(settings, "WEIGHT_SOCIAL", 0.12)
+    ml_weight = getattr(settings, "WEIGHT_ML", 0.10)
     raw = (
         settings.WEIGHT_PHYSICS * physics_score +
         settings.WEIGHT_TECHNICAL * technical_score +
         settings.WEIGHT_CATALYST * catalyst_score +
         settings.WEIGHT_STATISTICAL * statistical_score +
-        social_weight * social_score
+        social_weight * social_score +
+        ml_weight * ml_score
     )
 
     # Macro multiplier
@@ -142,6 +146,7 @@ def score_ticker(
         catalyst_score=round(catalyst_score, 1),
         statistical_score=round(statistical_score, 1),
         social_score=round(social_score, 1),
+        ml_score=round(ml_score, 1),
         political_exposure=si.get("political_exposure", ""),
         war_exposure=si.get("war_exposure", ""),
         influencer_signal=si.get("influencer_signal", ""),

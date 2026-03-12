@@ -81,6 +81,7 @@ with st.sidebar:
             "Commodities",
             "Macro",
             "Events",
+            "ML Predictions",
             "Predictions",
             "Alerts",
         ],
@@ -141,6 +142,7 @@ page_map = {
     "Commodities": "dashboard.pages.commodities",
     "Macro": "dashboard.pages.macro",
     "Events": "dashboard.pages.events",
+    "ML Predictions": "dashboard.pages.ml_predictions",
     "Predictions": "dashboard.pages.predictions",
     "Alerts": "dashboard.pages.alerts",
 }
