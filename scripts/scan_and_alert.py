@@ -27,6 +27,8 @@ load_dotenv()
 from signals.notifier import send_telegram
 from signals.recommendation import get_recommendation
 from config import settings
+from analysis.ml_confidence import compute_ml_confidence, get_confidence_tier
+from analysis.position_sizer import format_position_line
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +56,10 @@ def _format_option_alert(pick, rec: dict) -> str:
     budget = pick.option_budget or "N/A"
     conf = rec.get("confidence", 0)
 
+    # ML confidence
+    ml_conf = compute_ml_confidence(pick)
+    ml_tier = get_confidence_tier(ml_conf)
+
     # Support/resistance context
     levels = ""
     if pick.nearest_support > 0:
@@ -64,22 +70,27 @@ def _format_option_alert(pick, rec: dict) -> str:
     if pick.entry_price > 0 and pick.risk_reward > 0:
         rr = f"\n   Entry: <code>${pick.entry_price:.2f}</code> → Stop: <code>${pick.stop_price:.2f}</code> → Target: <code>${pick.target_price:.2f}</code>  (R:R {pick.risk_reward:.1f}x)"
 
+    # Position sizing
+    pos_line = ""
+    if pick.entry_price > 0 and pick.stop_price > 0:
+        pos_line = format_position_line(pick.entry_price, pick.stop_price)
+        if pos_line:
+            pos_line = f"\n{pos_line}"
+
     reasons = rec.get("reasons", [])[:3]
     reasons_str = "\n".join(f"   • {r}" for r in reasons) if reasons else ""
 
-    return (
+    base = (
         f"\n{emoji} <b>{direction} — {pick.ticker}</b>  (Score: {pick.composite_score:.0f})\n"
         f"   Strike: <code>${strike:.0f}</code>  |  Exp: {exp}  |  Budget: {budget}\n"
         f"   Price: <code>${pick.price:.2f}</code> ({pick.pct_change:+.1f}%)  |  Confidence: {conf}%\n"
-        f"   Regime: {pick.regime}  |  Phase: {pick.kinematic_phase}  |  RVOL: {pick.rel_volume:.1f}x"
-        f"{levels}{rr}"
-        f"\n{reasons_str}" if reasons_str else
-        f"\n{emoji} <b>{direction} — {pick.ticker}</b>  (Score: {pick.composite_score:.0f})\n"
-        f"   Strike: <code>${strike:.0f}</code>  |  Exp: {exp}  |  Budget: {budget}\n"
-        f"   Price: <code>${pick.price:.2f}</code> ({pick.pct_change:+.1f}%)  |  Confidence: {conf}%\n"
-        f"   Regime: {pick.regime}  |  Phase: {pick.kinematic_phase}  |  RVOL: {pick.rel_volume:.1f}x"
-        f"{levels}{rr}"
+        f"   Regime: {pick.regime}  |  Phase: {pick.kinematic_phase}  |  RVOL: {pick.rel_volume:.1f}x\n"
+        f"   ML Confidence: {ml_tier} ({ml_conf:.0f}%)"
+        f"{levels}{rr}{pos_line}"
     )
+    if reasons_str:
+        base += f"\n{reasons_str}"
+    return base
 
 
 def _format_day_trade(pick, rec: dict) -> str:
@@ -88,24 +99,34 @@ def _format_day_trade(pick, rec: dict) -> str:
     conf = rec.get("confidence", 0)
     dir_emoji = "📈" if pick.direction == "LONG" else "📉"
 
+    # ML confidence
+    ml_conf = compute_ml_confidence(pick)
+    ml_tier = get_confidence_tier(ml_conf)
+
     levels = ""
     if pick.entry_price > 0:
         levels = f"\n   Entry: <code>${pick.entry_price:.2f}</code> → Stop: <code>${pick.stop_price:.2f}</code> → Target: <code>${pick.target_price:.2f}</code>  (R:R {pick.risk_reward:.1f}x)"
 
+    # Position sizing
+    pos_line = ""
+    if pick.entry_price > 0 and pick.stop_price > 0:
+        pos_line = format_position_line(pick.entry_price, pick.stop_price)
+        if pos_line:
+            pos_line = f"\n{pos_line}"
+
     reasons = rec.get("reasons", [])[:2]
     reasons_str = "\n".join(f"   • {r}" for r in reasons) if reasons else ""
 
-    return (
+    base = (
         f"\n{dir_emoji} <b>DAY TRADE — {pick.ticker}</b>  ({signal} {conf}%)\n"
         f"   Price: <code>${pick.price:.2f}</code> ({pick.pct_change:+.1f}%)  |  Score: {pick.composite_score:.0f}\n"
-        f"   Phase: {pick.kinematic_phase}  |  RVOL: {pick.rel_volume:.1f}x  |  RSI: {pick.rsi:.0f}"
-        f"{levels}"
-        f"\n{reasons_str}" if reasons_str else
-        f"\n{dir_emoji} <b>DAY TRADE — {pick.ticker}</b>  ({signal} {conf}%)\n"
-        f"   Price: <code>${pick.price:.2f}</code> ({pick.pct_change:+.1f}%)  |  Score: {pick.composite_score:.0f}\n"
-        f"   Phase: {pick.kinematic_phase}  |  RVOL: {pick.rel_volume:.1f}x  |  RSI: {pick.rsi:.0f}"
-        f"{levels}"
+        f"   Phase: {pick.kinematic_phase}  |  RVOL: {pick.rel_volume:.1f}x  |  RSI: {pick.rsi:.0f}\n"
+        f"   ML Confidence: {ml_tier} ({ml_conf:.0f}%)"
+        f"{levels}{pos_line}"
     )
+    if reasons_str:
+        base += f"\n{reasons_str}"
+    return base
 
 
 def _format_swing_trade(pick, rec: dict) -> str:
@@ -113,6 +134,10 @@ def _format_swing_trade(pick, rec: dict) -> str:
     signal = rec.get("signal", "HOLD")
     conf = rec.get("confidence", 0)
     dir_emoji = "🔵" if pick.direction == "LONG" else "🟠"
+
+    # ML confidence
+    ml_conf = compute_ml_confidence(pick)
+    ml_tier = get_confidence_tier(ml_conf)
 
     # Swing trades show option play if available
     option_line = ""
@@ -123,20 +148,26 @@ def _format_swing_trade(pick, rec: dict) -> str:
     if pick.nearest_support > 0:
         levels = f"\n   Support: <code>${pick.nearest_support:.2f}</code>  |  Resistance: <code>${pick.nearest_resistance:.2f}</code>"
 
+    # Position sizing
+    pos_line = ""
+    if getattr(pick, 'entry_price', 0) > 0 and getattr(pick, 'stop_price', 0) > 0:
+        pos_line = format_position_line(pick.entry_price, pick.stop_price)
+        if pos_line:
+            pos_line = f"\n{pos_line}"
+
     reasons = rec.get("reasons", [])[:2]
     reasons_str = "\n".join(f"   • {r}" for r in reasons) if reasons else ""
 
-    return (
+    base = (
         f"\n{dir_emoji} <b>SWING — {pick.ticker}</b>  ({signal} {conf}%)\n"
         f"   Price: <code>${pick.price:.2f}</code> ({pick.pct_change:+.1f}%)  |  Score: {pick.composite_score:.0f}\n"
-        f"   Regime: {pick.regime}  |  Hurst: {pick.hurst:.2f}  |  RVOL: {pick.rel_volume:.1f}x"
-        f"{option_line}{levels}"
-        f"\n{reasons_str}" if reasons_str else
-        f"\n{dir_emoji} <b>SWING — {pick.ticker}</b>  ({signal} {conf}%)\n"
-        f"   Price: <code>${pick.price:.2f}</code> ({pick.pct_change:+.1f}%)  |  Score: {pick.composite_score:.0f}\n"
-        f"   Regime: {pick.regime}  |  Hurst: {pick.hurst:.2f}  |  RVOL: {pick.rel_volume:.1f}x"
-        f"{option_line}{levels}"
+        f"   Regime: {pick.regime}  |  Hurst: {pick.hurst:.2f}  |  RVOL: {pick.rel_volume:.1f}x\n"
+        f"   ML Confidence: {ml_tier} ({ml_conf:.0f}%)"
+        f"{option_line}{levels}{pos_line}"
     )
+    if reasons_str:
+        base += f"\n{reasons_str}"
+    return base
 
 
 # ─────────────────────────────────────────────────────────────
@@ -186,6 +217,11 @@ def classify_setup(pick, rec: dict) -> list:
         # Swing trades with options attached
         opt_type = "option_call" if pick.option_direction == "CALL" else "option_put"
         types.append(opt_type)
+
+    # ML confidence filter — only include high-confidence setups
+    ml_conf = compute_ml_confidence(pick)
+    if ml_conf < 45 and not types:
+        return types  # Skip low confidence without any type
 
     return types
 

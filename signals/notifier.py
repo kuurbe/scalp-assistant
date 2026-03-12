@@ -66,6 +66,28 @@ def send_telegram(message: str, bot_token: str = None, chat_id: str = None) -> b
 
 
 # ─────────────────────────────────────────────────────────────
+#  Channel: Telegram photo
+# ─────────────────────────────────────────────────────────────
+def send_telegram_photo(photo_bytes: bytes, caption: str = "", bot_token: str = None, chat_id: str = None) -> bool:
+    """Send a photo via Telegram Bot API."""
+    try:
+        import requests
+        token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        cid = chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
+        if not token or not cid:
+            return False
+
+        url = f"https://api.telegram.org/bot{token}/sendPhoto"
+        files = {"photo": ("chart.png", photo_bytes, "image/png")}
+        data = {"chat_id": cid, "caption": caption[:1024], "parse_mode": "HTML"}
+        resp = requests.post(url, files=files, data=data, timeout=15)
+        return resp.status_code == 200
+    except Exception:
+        logger.debug("Failed to send Telegram photo", exc_info=True)
+        return False
+
+
+# ─────────────────────────────────────────────────────────────
 #  Channel: Discord
 # ─────────────────────────────────────────────────────────────
 def send_discord(message: str, webhook_url: str = None) -> bool:

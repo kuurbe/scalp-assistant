@@ -178,3 +178,62 @@ def is_spark(prices: pd.Series) -> bool:
         )
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Kinetic Energy + Momentum Physics
+# ---------------------------------------------------------------------------
+
+def compute_kinetic_energy(prices: pd.Series, volumes: pd.Series = None, decay_bars: int = 20) -> dict:
+    """
+    Compute physics-based kinetic energy with half-life decay.
+    KE = 0.5 * mass * velocity^2
+    Mass = volume (or 1.0 if no volume)
+    Velocity = 5-bar rate of change
+    Apply exponential decay so old signals fade.
+    """
+    try:
+        prices = prices.astype(float).dropna()
+        if len(prices) < 10:
+            return {"kinetic_energy": 0.0, "momentum": 0.0, "energy_score": 0.0}
+
+        velocity = prices.pct_change(periods=5) * 100
+        acceleration = velocity.diff()
+
+        if volumes is not None and len(volumes) == len(prices):
+            mass = volumes.rolling(10).mean().fillna(volumes.mean())
+        else:
+            mass = pd.Series(1.0, index=prices.index)
+
+        # KE = 0.5 * m * v^2
+        ke = 0.5 * mass * (velocity ** 2)
+
+        # Exponential half-life decay
+        n = len(ke)
+        decay = np.exp(-np.log(2) * np.arange(n)[::-1] / decay_bars)
+        ke_decayed = ke * decay
+
+        # Momentum p = m * v
+        momentum = mass * velocity
+
+        # Normalize to 0-100 score
+        ke_latest = float(ke_decayed.iloc[-1]) if not np.isnan(ke_decayed.iloc[-1]) else 0.0
+        ke_mean = float(ke_decayed.mean()) if not np.isnan(ke_decayed.mean()) else 1.0
+
+        # Score: how much current KE exceeds average (volume-boosted)
+        vol_boost = 1.0
+        if volumes is not None and len(volumes) > 1:
+            vol_ratio = float(volumes.iloc[-1] / volumes.mean()) if volumes.mean() > 0 else 1.0
+            vol_boost = min(max(vol_ratio, 0.5), 3.0)
+
+        raw_score = (ke_latest / max(ke_mean, 1e-10)) * vol_boost * 25
+        energy_score = float(np.clip(raw_score, 0, 100))
+
+        return {
+            "kinetic_energy": round(ke_latest, 4),
+            "momentum": round(float(momentum.iloc[-1]) if not np.isnan(momentum.iloc[-1]) else 0.0, 4),
+            "energy_score": round(energy_score, 1),
+            "acceleration": round(float(acceleration.iloc[-1]) if not np.isnan(acceleration.iloc[-1]) else 0.0, 4),
+        }
+    except Exception:
+        return {"kinetic_energy": 0.0, "momentum": 0.0, "energy_score": 0.0, "acceleration": 0.0}
