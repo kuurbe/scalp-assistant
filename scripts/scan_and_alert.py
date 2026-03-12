@@ -29,7 +29,7 @@ from signals.recommendation import get_recommendation
 from config import settings
 from analysis.ml_confidence import compute_ml_confidence, get_confidence_tier, log_training_sample
 from analysis.position_sizer import format_position_line
-from signals.chart_generator import generate_alert_chart, generate_summary_chart
+from signals.chart_generator import generate_alert_chart, generate_summary_chart, generate_candlestick_chart
 
 logging.basicConfig(
     level=logging.INFO,
@@ -310,6 +310,29 @@ def run_full_scan(asset_classes: list = None) -> None:
     _dispatch_alerts(all_results)
 
 
+def _send_candlestick_for_pick(pick) -> None:
+    """Fetch OHLCV and send a candlestick chart for a top pick via Telegram."""
+    try:
+        import yfinance as yf
+        df = yf.download(pick.ticker, period="3mo", interval="1d", progress=False)
+        if df is None or len(df) < 10:
+            return
+        chart = generate_candlestick_chart(
+            ticker=pick.ticker,
+            df=df,
+            entry=getattr(pick, "entry_price", None),
+            stop=getattr(pick, "stop_price", None),
+            target=getattr(pick, "target_price", None),
+            score=getattr(pick, "composite_score", None),
+            phase=getattr(pick, "kinematic_phase", None),
+            energy_regime=getattr(pick, "energy_regime", None),
+        )
+        if chart:
+            send_telegram_photo(chart, caption=f"📊 {pick.ticker} — Candlestick Chart")
+    except Exception as e:
+        log.debug("Candlestick chart failed for %s: %s", getattr(pick, "ticker", "?"), e)
+
+
 def _dispatch_alerts(results: dict) -> None:
     """Send categorized alerts to Telegram."""
     calls = results["option_calls"][:8]
@@ -377,6 +400,10 @@ def _dispatch_alerts(results: dict) -> None:
             log.info("Sent summary with chart (%d top picks)", len(chart_data))
         else:
             send_telegram(summary)
+
+        # Send candlestick charts for top 3 picks
+        for _, _, _, pick in top_picks[:3]:
+            _send_candlestick_for_pick(pick)
     else:
         send_telegram(summary)
 
