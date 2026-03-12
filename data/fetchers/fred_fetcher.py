@@ -27,7 +27,8 @@ def _get_fred_client():
     Return the FRED API key string, or None if not set.
     Kept for backward compatibility with data_bridge imports.
     """
-    api_key = os.environ.get("FRED_KEY")
+    from config.settings import get_secret
+    api_key = get_secret("FRED_KEY")
     if not api_key:
         logger.warning("FRED_KEY not set — returning default macro context")
         return None

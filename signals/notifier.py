@@ -6,6 +6,8 @@ import logging
 import os
 import smtplib
 import subprocess
+
+from config.settings import get_secret
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -37,8 +39,8 @@ def send_telegram(message: str, bot_token: str = None, chat_id: str = None) -> b
     try:
         import requests
 
-        token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
-        cid = chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
+        token = bot_token or get_secret("TELEGRAM_BOT_TOKEN", "")
+        cid = chat_id or get_secret("TELEGRAM_CHAT_ID", "")
 
         if not token or not cid:
             logger.debug("Telegram not configured (missing bot_token or chat_id)")
@@ -72,8 +74,8 @@ def send_telegram_photo(photo_bytes: bytes, caption: str = "", bot_token: str = 
     """Send a photo via Telegram Bot API."""
     try:
         import requests
-        token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
-        cid = chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
+        token = bot_token or get_secret("TELEGRAM_BOT_TOKEN", "")
+        cid = chat_id or get_secret("TELEGRAM_CHAT_ID", "")
         if not token or not cid:
             return False
 

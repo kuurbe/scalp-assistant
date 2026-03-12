@@ -2,6 +2,19 @@
 Global configuration for Scalp Assistant v4.
 All thresholds, weights, ticker universes, asset class configs, and API settings.
 """
+import os
+
+
+def get_secret(key: str, default: str | None = None) -> str | None:
+    """Get a secret from Streamlit Cloud secrets first, then fall back to os.environ."""
+    try:
+        import streamlit as st
+        val = st.secrets.get(key)
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    return os.environ.get(key, default)
 
 # ─────────────────────────────────────────────────────────────
 #  TICKER UNIVERSE — scanned daily, add/remove freely

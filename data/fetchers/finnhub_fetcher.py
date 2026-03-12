@@ -56,7 +56,8 @@ def _rate_limit() -> None:
 
 def _get_api_key() -> str | None:
     """Return the Finnhub API key or None."""
-    return os.environ.get("FINNHUB_KEY")
+    from config.settings import get_secret
+    return get_secret("FINNHUB_KEY")
 
 
 def _finnhub_get(endpoint: str, params: dict | None = None) -> dict | list | None:

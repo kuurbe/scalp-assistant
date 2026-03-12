@@ -56,7 +56,8 @@ ITEM_DECODER = {
 
 def _get_sec_headers() -> dict:
     """Return headers with the required User-Agent for SEC EDGAR."""
-    email = os.environ.get("SEC_EMAIL", "anonymous@example.com")
+    from config.settings import get_secret
+    email = get_secret("SEC_EMAIL", "anonymous@example.com")
     return {
         "User-Agent": f"ScalpAssistant/3.0 ({email})",
         "Accept-Encoding": "gzip, deflate",

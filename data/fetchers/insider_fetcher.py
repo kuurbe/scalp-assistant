@@ -13,7 +13,8 @@ FINNHUB_BASE = "https://finnhub.io/api/v1"
 
 
 def _get_finnhub_key() -> str | None:
-    return os.environ.get("FINNHUB_API_KEY") or os.environ.get("FINNHUB_KEY")
+    from config.settings import get_secret
+    return get_secret("FINNHUB_API_KEY") or get_secret("FINNHUB_KEY")
 
 
 @cached(ttl=900)

@@ -237,7 +237,8 @@ def _start_websocket(symbols: list) -> threading.Thread | None:
     """Start Finnhub WebSocket in background thread (optional)."""
     try:
         import os
-        key = os.environ.get("FINNHUB_KEY")
+        from config.settings import get_secret
+        key = get_secret("FINNHUB_KEY")
         if not key:
             return None
 
