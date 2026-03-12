@@ -1,19 +1,17 @@
 """
 FRED macro data fetcher — federal funds rate, yield curve, VIX, consumer sentiment.
-Uses the fredapi library for Federal Reserve Economic Data.
+Uses direct FRED REST API via requests (avoids fredapi SSL hangs on macOS).
 """
 import logging
 import os
-import ssl
 
-# Fix macOS SSL certificate issues
-if hasattr(ssl, '_create_unverified_context'):
-    ssl._create_default_https_context = ssl._create_unverified_context
-
+import requests
 from data.cache import cached
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+FRED_API_BASE = "https://api.stlouisfed.org/fred/series/observations"
 
 _DEFAULT_CONTEXT = {
     "fed_rate": None,
@@ -26,44 +24,46 @@ _DEFAULT_CONTEXT = {
 
 def _get_fred_client():
     """
-    Create and return a Fred client, or None if no API key is available.
-    Import is deferred so the module loads even if fredapi isn't installed.
+    Return the FRED API key string, or None if not set.
+    Kept for backward compatibility with data_bridge imports.
     """
     api_key = os.environ.get("FRED_KEY")
     if not api_key:
         logger.warning("FRED_KEY not set — returning default macro context")
         return None
-    try:
-        from fredapi import Fred
-        return Fred(api_key=api_key)
-    except ImportError:
-        logger.error("fredapi library not installed — pip install fredapi")
-        return None
-    except Exception as e:
-        logger.error("Failed to create Fred client: %s", e)
-        return None
+    return api_key
 
 
-def _fetch_latest_value(fred, series_id: str) -> float | None:
+def _fetch_latest_value(fred_key, series_id: str) -> float | None:
     """
-    Fetch the most recent non-NaN value for a FRED series.
+    Fetch the most recent non-NaN value for a FRED series via REST API.
 
     Args:
-        fred: Fred client instance.
+        fred_key: FRED API key string (from _get_fred_client).
         series_id: FRED series identifier.
 
     Returns:
         Most recent float value, or None on failure.
     """
     try:
-        series = fred.get_series(series_id)
-        if series is None or series.empty:
-            return None
-        # Drop NaN values and get the last one
-        series = series.dropna()
-        if series.empty:
-            return None
-        return round(float(series.iloc[-1]), 4)
+        resp = requests.get(
+            FRED_API_BASE,
+            params={
+                "series_id": series_id,
+                "api_key": fred_key,
+                "file_type": "json",
+                "limit": 5,
+                "sort_order": "desc",
+            },
+            timeout=8,
+        )
+        resp.raise_for_status()
+        observations = resp.json().get("observations", [])
+        for obs in observations:
+            val = obs.get("value", ".")
+            if val != ".":
+                return round(float(val), 4)
+        return None
     except Exception as e:
         logger.debug("Failed to fetch FRED series %s: %s", series_id, e)
         return None
@@ -141,8 +141,8 @@ def get_macro_context() -> dict:
             consumer_sentiment (float | None): Latest consumer sentiment
             macro_regime (str): "RISK_ON", "RISK_OFF", or "NEUTRAL"
     """
-    fred = _get_fred_client()
-    if fred is None:
+    fred_key = _get_fred_client()
+    if fred_key is None:
         return dict(_DEFAULT_CONTEXT)
 
     try:
@@ -157,7 +157,7 @@ def get_macro_context() -> dict:
         result = {}
         for series_id in settings.FRED_SERIES:
             key = series_map.get(series_id, series_id.lower())
-            result[key] = _fetch_latest_value(fred, series_id)
+            result[key] = _fetch_latest_value(fred_key, series_id)
 
         result["macro_regime"] = _determine_regime(
             result.get("fed_rate"),

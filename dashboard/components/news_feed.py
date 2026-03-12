@@ -183,13 +183,31 @@ def news_ticker_bar(news_items: list, max_items: int = 5):
         return
 
     ticker_content = "".join(headlines)
-    st.markdown(f"""
-    <div style="background:{COLORS['card']};border:1px solid {COLORS['border']};border-radius:12px;
-                padding:10px 16px;margin-bottom:16px;overflow:hidden;white-space:nowrap;">
+    # Use streamlit.components.v1.html for full iframe with JS-driven scroll
+    import streamlit.components.v1 as components
+    html_code = f"""
+    <div id="ticker-wrap" style="background:{COLORS['card']};border:1px solid {COLORS['border']};border-radius:12px;padding:10px 16px;overflow:hidden;white-space:nowrap;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
         <div style="display:flex;align-items:center;">
-            <span style="background:{COLORS['danger']};color:white;padding:2px 8px;border-radius:5px;
-                         font-size:10px;font-weight:700;margin-right:12px;flex-shrink:0;">LIVE</span>
-            <div style="overflow:hidden;text-overflow:ellipsis;">{ticker_content}</div>
+            <span style="background:{COLORS['danger']};color:white;padding:2px 8px;border-radius:5px;font-size:10px;font-weight:700;margin-right:12px;flex-shrink:0;">LIVE</span>
+            <div id="ticker-viewport" style="overflow:hidden;flex:1;">
+                <div id="ticker-track" style="display:inline-block;white-space:nowrap;">{ticker_content}{ticker_content}</div>
+            </div>
         </div>
     </div>
-    """, unsafe_allow_html=True)
+    <script>
+    (function() {{
+        var track = document.getElementById('ticker-track');
+        var pos = 0;
+        var speed = 0.5;
+        var half = track.scrollWidth / 2;
+        function step() {{
+            pos -= speed;
+            if (pos <= -half) pos = 0;
+            track.style.transform = 'translateX(' + pos + 'px)';
+            requestAnimationFrame(step);
+        }}
+        requestAnimationFrame(step);
+    }})();
+    </script>
+    """
+    components.html(html_code, height=46, scrolling=False)

@@ -17,6 +17,56 @@ from dashboard.components.market_widgets import (
 from dashboard import data_bridge
 
 
+def _run_scan_with_progress(scan_key: str, is_simple: bool):
+    """Run stock scan with a progress bar for faster perceived loading."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from config import settings
+    from modes.morning_scan import _analyze_ticker
+
+    universe = settings.get_universe("stocks")
+    if not universe:
+        st.session_state[scan_key] = []
+        return
+
+    # Pre-fetch shared data
+    shared = data_bridge._prefetch_shared_data("stocks")
+    macro_regime = shared.get("macro", "NEUTRAL")
+    reddit_data = shared.get("reddit", {})
+    political_pulse = shared.get("political", {})
+    war_watch = shared.get("war", {})
+    influencer_pulse = shared.get("influencer", {})
+
+    total = len(universe)
+    progress = st.progress(0, text="Scanning markets...")
+    results = []
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {
+            pool.submit(
+                _analyze_ticker, ticker, macro_regime, reddit_data, {},
+                political_pulse, war_watch, influencer_pulse, "stocks"
+            ): ticker
+            for ticker in universe
+        }
+        for future in as_completed(futures):
+            done += 1
+            ticker = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    results.append(result)
+            except Exception:
+                pass
+            if done % 4 == 0 or done == total:
+                pct = done / total
+                progress.progress(pct, text=f"Scanning {ticker}... ({done}/{total})")
+
+    progress.empty()
+    results.sort(key=lambda x: x.composite_score, reverse=True)
+    st.session_state[scan_key] = results
+
+
 def _risk_color(level: str) -> str:
     level_upper = (level or "").upper()
     if level_upper in ("EXTREME", "CRITICAL"):
@@ -549,31 +599,30 @@ def render():
         col_btn, _ = st.columns([1, 5])
         with col_btn:
             if st.button("Refresh Scan", type="secondary"):
-                with st.spinner("Scanning markets..."):
-                    stocks = data_bridge.scan_universe("stocks")
-                    st.session_state[scan_key] = stocks
+                _run_scan_with_progress(scan_key, is_simple)
                 st.rerun()
     else:
         button_text = "Find Best Stocks" if is_simple else "Scan Markets"
         st.markdown(f"""
-        <div style="{CARD_CSS} text-align:center; padding:40px;">
+        <div style="{CARD_CSS} text-align:center; padding:40px 32px 32px 32px;">
             <div style="width:48px;height:48px;border-radius:50%;background:{COLORS['accent']}10;
                         display:flex;align-items:center;justify-content:center;margin:0 auto 16px auto;">
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="{COLORS['accent']}" stroke-width="2"><path d="M23 6l-9.5 9.5-5-5L1 18M17 6h6v6"/></svg>
             </div>
-            <div style="font-size:16px; font-weight:500; color:{COLORS['text']}; margin-bottom:8px;">
+            <div style="font-size:16px; font-weight:500; color:{COLORS['text']}; margin-bottom:6px;">
                 {"Ready to find opportunities" if is_simple else "Stock Scanner Ready"}
             </div>
-            <div style="font-size:14px; color:{COLORS['text_secondary']}; margin-bottom:4px;">
-                {"Click below to scan 96 stocks and find the best trades" if is_simple else "Run the scanner to analyze 96 tickers across all sectors"}
+            <div style="font-size:13px; color:{COLORS['text_secondary']}; margin-bottom:20px;">
+                {"Scan 96 stocks and find the best trades" if is_simple else "Analyze 96 tickers across all sectors"}
             </div>
         </div>
         """, unsafe_allow_html=True)
-        if st.button(button_text, type="primary"):
-            with st.spinner("Finding the best opportunities..." if is_simple else "Scanning 96 tickers..."):
-                stocks = data_bridge.scan_universe("stocks")
-                st.session_state[scan_key] = stocks
-            st.rerun()
+
+        _, col_center, _ = st.columns([1, 2, 1])
+        with col_center:
+            if st.button(button_text, type="primary", use_container_width=True):
+                _run_scan_with_progress(scan_key, is_simple)
+                st.rerun()
 
     # ──────────────────────────────────────────────────────────
     # Live News Feed (always visible, auto-updates every 3 min)
