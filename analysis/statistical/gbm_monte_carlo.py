@@ -203,6 +203,96 @@ def run_gbm_simulation(
 # Public API -- scoring
 # ---------------------------------------------------------------------------
 
+def run_daily_gbm(
+    S0: float,
+    mu_annual: float,
+    sigma_annual: float,
+    n_days: int = 14,
+    n_sims: int = 1000,
+    strike: float = None,
+) -> dict:
+    """Run multi-day GBM Monte Carlo for options probability.
+
+    Uses daily steps (Δt = 1/365) with annualized drift and volatility.
+    Returns P(ITM), confidence cones, and percentile bands.
+
+    The GBM daily step:
+        S_{t+1} = S_t * exp((μ - σ²/2)Δt + σ√Δt * Z)
+
+    P(ITM) = (1/N) * Σ 𝟙[S_T >= K]  (for calls)
+
+    Percentile bands at each step t:
+        Band_p = Percentile_p(S_t^(1), ..., S_t^(N))
+    """
+    _default = {
+        "p_itm": 0.0,
+        "expected_price": S0,
+        "median_price": S0,
+        "percentiles": {},
+        "cone": [],
+    }
+
+    try:
+        if S0 <= 0 or sigma_annual <= 0 or n_days < 1:
+            return _default
+
+        dt = 1.0 / 365.0  # daily step
+
+        # Per-step drift and diffusion (annualized params)
+        drift = (mu_annual - 0.5 * sigma_annual**2) * dt
+        diffusion = sigma_annual * np.sqrt(dt)
+
+        # Generate all random draws: (n_sims, n_days)
+        Z = np.random.standard_normal((n_sims, n_days))
+        log_increments = drift + diffusion * Z
+
+        # Build cumulative paths
+        log_paths = np.cumsum(log_increments, axis=1)
+        log_paths = np.hstack([np.zeros((n_sims, 1)), log_paths])
+        price_paths = S0 * np.exp(log_paths)  # shape: (n_sims, n_days+1)
+
+        final_prices = price_paths[:, -1]
+
+        # P(ITM) — fraction finishing above strike
+        if strike and strike > 0:
+            p_itm = float(np.mean(final_prices >= strike))
+        else:
+            p_itm = 0.0
+
+        # Percentile bands at each time step (confidence cones)
+        cone = []
+        for t in range(n_days + 1):
+            step_prices = price_paths[:, t]
+            cone.append({
+                "day": t,
+                "p5": round(float(np.percentile(step_prices, 5)), 2),
+                "p25": round(float(np.percentile(step_prices, 25)), 2),
+                "p50": round(float(np.percentile(step_prices, 50)), 2),
+                "p75": round(float(np.percentile(step_prices, 75)), 2),
+                "p95": round(float(np.percentile(step_prices, 95)), 2),
+            })
+
+        # Terminal distribution percentiles
+        percentiles = {
+            "p5": round(float(np.percentile(final_prices, 5)), 2),
+            "p25": round(float(np.percentile(final_prices, 25)), 2),
+            "p50": round(float(np.percentile(final_prices, 50)), 2),
+            "p75": round(float(np.percentile(final_prices, 75)), 2),
+            "p95": round(float(np.percentile(final_prices, 95)), 2),
+        }
+
+        return {
+            "p_itm": round(p_itm, 4),
+            "expected_price": round(float(np.mean(final_prices)), 2),
+            "median_price": round(float(np.median(final_prices)), 2),
+            "percentiles": percentiles,
+            "cone": cone,
+        }
+
+    except Exception:
+        return _default
+
+
 def get_gbm_score(
     prices: pd.Series,
     stop_price: float,

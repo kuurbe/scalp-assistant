@@ -115,7 +115,7 @@ def compute_option_probabilities(pick) -> dict:
 
         result = {"iv_est": round(iv * 100, 1)}
 
-        # Safe strike probability
+        # Safe strike probability (Black-Scholes)
         if safe_strike > 0:
             safe = black_scholes_prob(price, safe_strike, days_to_expiry, iv, direction=direction)
             result["safe_prob_itm"] = safe["prob_itm"]
@@ -126,6 +126,26 @@ def compute_option_probabilities(pick) -> dict:
             agg = black_scholes_prob(price, agg_strike, days_to_expiry, iv, direction=direction)
             result["agg_prob_itm"] = agg["prob_itm"]
             result["agg_delta"] = agg["delta"]
+
+        # Monte Carlo GBM P(ITM) for cross-validation
+        try:
+            from analysis.statistical.gbm_monte_carlo import run_daily_gbm
+            # Estimate annualized drift from pct_change
+            pct = getattr(pick, "pct_change", 0)
+            mu_annual = (pct / 100) * 252  # rough annualized from today's move
+            mc = run_daily_gbm(
+                S0=price,
+                mu_annual=mu_annual,
+                sigma_annual=iv,
+                n_days=days_to_expiry,
+                n_sims=1000,
+                strike=safe_strike if direction == "CALL" else None,
+            )
+            result["mc_prob_itm"] = round(mc["p_itm"] * 100, 1)
+            result["mc_median_price"] = mc["median_price"]
+            result["mc_cone"] = mc.get("cone", [])
+        except Exception:
+            pass
 
         return result
 
