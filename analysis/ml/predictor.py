@@ -64,7 +64,7 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
     featured = build_features(df)
 
     # Targets
-    featured["target_ret"] = featured["Close"].pct_change(fill_method=None).shift(-1) * 100
+    featured["target_ret"] = featured["Close"].pct_change().shift(-1) * 100
     featured["target_dir"] = (featured["target_ret"] > 0.05).astype(int)
 
     clean = featured.dropna(subset=FEATURE_COLS + ["target_ret"])

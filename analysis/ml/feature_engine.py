@@ -253,14 +253,14 @@ def compute_cross_asset_features(df: pd.DataFrame) -> pd.DataFrame:
     tlt_data = _fetch_cross_asset("TLT", n)
 
     if vix_data is not None and len(vix_data) >= n:
-        out["vix_level"] = vix_data["Close"].reindex(out.index).fillna(method="ffill").fillna(20.0).values
+        out["vix_level"] = vix_data["Close"].reindex(out.index).ffill().fillna(20.0).values
         out["vix_change_1d"] = pd.Series(out["vix_level"]).pct_change().fillna(0).values * 100
     else:
         out["vix_level"] = 20.0
         out["vix_change_1d"] = 0.0
 
     if tlt_data is not None and len(tlt_data) >= n:
-        tlt_close = tlt_data["Close"].reindex(out.index).fillna(method="ffill")
+        tlt_close = tlt_data["Close"].reindex(out.index).ffill()
         out["tlt_ret_1d"] = tlt_close.pct_change().fillna(0).values * 100
     else:
         out["tlt_ret_1d"] = 0.0
@@ -294,8 +294,8 @@ def compute_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     c = out["Close"]
 
-    out["ret_5d"] = c.pct_change(5, fill_method=None) * 100
-    out["ret_20d"] = c.pct_change(20, fill_method=None) * 100
+    out["ret_5d"] = c.pct_change(5) * 100
+    out["ret_20d"] = c.pct_change(20) * 100
 
     # Z-score (mean reversion signal)
     mean_20 = c.rolling(20).mean()

@@ -14,7 +14,7 @@ from dashboard.theme import COLORS, CARD_CSS, FONT
 # ── Cache helpers ───────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _fetch_ohlcv(ticker: str, period: str = "120d"):
+def _fetch_ohlcv(ticker: str, period: str = "1y"):
     import yfinance as yf
     df = yf.download(ticker, period=period, progress=False)
     if df is not None and isinstance(df.columns, pd.MultiIndex):

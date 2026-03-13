@@ -53,8 +53,19 @@ def _detail_row(label: str, value: str, color: str = None) -> str:
     )
 
 
+def _safe_float(v, default=0.0) -> float:
+    """Coerce to float, replacing NaN/None with default."""
+    import math
+    try:
+        f = float(v)
+        return default if math.isnan(f) else f
+    except (TypeError, ValueError):
+        return default
+
+
 def _level_badge(label: str, value: float, color: str) -> str:
     """Render a price level badge."""
+    value = _safe_float(value)
     return (
         f'<div style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;'
         f'border-radius:6px;background:{color}12;margin-right:8px;">'
@@ -65,6 +76,18 @@ def _level_badge(label: str, value: float, color: str) -> str:
 
 def ticker_card(pick, rank: int = 0, show_details: bool = True):
     """Render a detailed ticker card."""
+    # Sanitize NaN values before formatting
+    pick.price = _safe_float(pick.price)
+    pick.pct_change = _safe_float(pick.pct_change)
+    pick.composite_score = _safe_float(pick.composite_score)
+    pick.rel_volume = _safe_float(pick.rel_volume, 1.0)
+    pick.rsi = _safe_float(pick.rsi, 50.0)
+    pick.risk_reward = _safe_float(pick.risk_reward)
+    pick.entry_price = _safe_float(pick.entry_price)
+    pick.stop_price = _safe_float(pick.stop_price)
+    pick.target_price = _safe_float(pick.target_price)
+    pick.hurst = _safe_float(pick.hurst, 0.5)
+
     sc = score_color(pick.composite_score)
     cc = change_color(pick.pct_change)
     arrow = "+" if pick.pct_change >= 0 else ""
