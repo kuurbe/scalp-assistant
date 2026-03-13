@@ -174,57 +174,259 @@ def _format_swing_trade(pick, rec: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-#  Classification — categorize each scored ticker
+#  Confluence scoring — multi-factor confirmation system
+#  Only alerts on trades with REAL confluence, not single signals
 # ─────────────────────────────────────────────────────────────
 
-def classify_setup(pick, rec: dict) -> list:
+def _get_trading_window(asset_class: str = "stocks") -> str:
+    """Return current trading window: 'prime', 'active', 'dead', 'closed'.
+
+    For stocks/ETFs:
+      Prime:  9:30-11:00 AM ET — highest win-rate window
+      Active: 11:00-11:30 AM, 2:00-4:00 PM ET
+      Dead:   11:30 AM-2:00 PM ET — chop zone, only A+ setups
+      Closed: outside market hours
+
+    For crypto: always 'active' (24/7 market), except 1-5 AM ET = 'dead'
     """
-    Classify a scored ticker into trade types.
-    Returns list of: 'option_call', 'option_put', 'day_trade', 'swing'
+    try:
+        et = ZoneInfo("America/New_York")
+        now = datetime.datetime.now(et)
+        h, m = now.hour, now.minute
+        t = h * 60 + m  # minutes since midnight
+
+        # Crypto trades 24/7
+        if asset_class == "crypto":
+            if 1 <= h < 5:
+                return "dead"  # lowest volume window
+            return "active"
+
+        if now.weekday() >= 5:
+            return "closed"
+        if t < 9 * 60 + 30 or t > 16 * 60:
+            return "closed"
+        if t <= 11 * 60:         # 9:30 - 11:00
+            return "prime"
+        if t <= 11 * 60 + 30:    # 11:00 - 11:30
+            return "active"
+        if t <= 14 * 60:         # 11:30 - 2:00
+            return "dead"
+        return "active"           # 2:00 - 4:00
+    except Exception:
+        return "active"
+
+
+def _compute_confluence(pick, rec: dict) -> dict:
+    """Compute multi-factor confluence score for a setup.
+
+    Returns dict with:
+      - confluence_points: int (number of confirming factors, 0-7)
+      - tier: 'A+', 'A', 'B', 'C' (only A+/A get alerted)
+      - flags: list of confirmation signals met
+      - suppressed: bool (if a suppression condition is active)
+      - suppress_reason: str
     """
+    score = pick.composite_score
+    phase = pick.kinematic_phase
+    regime = pick.regime
+    rvol = pick.rel_volume
+    rsi = pick.rsi
+    rr = pick.risk_reward
+    pct = pick.pct_change
+    ml_conf = compute_ml_confidence(pick)
+    signal = rec.get("signal", "HOLD")
+
+    flags = []
+    points = 0
+
+    # ── SUPPRESSION CHECKS (hard kills — never alert) ──
+    # Chasing: stock already moved 7%+ today — too late (4+ ATR move)
+    if abs(pct) > 7.0:
+        return {"confluence_points": 0, "tier": "C", "flags": [],
+                "suppressed": True, "suppress_reason": f"Chasing ({pct:+.1f}% move)"}
+
+    # R:R too low — no edge if risk > reward
+    if 0 < rr < 1.0:
+        return {"confluence_points": 0, "tier": "C", "flags": [],
+                "suppressed": True, "suppress_reason": f"Bad R:R ({rr:.1f}x)"}
+
+    # RSI extreme chasing: RSI > 80 for longs, < 20 for shorts
+    if pick.direction == "LONG" and rsi > 80:
+        return {"confluence_points": 0, "tier": "C", "flags": [],
+                "suppressed": True, "suppress_reason": f"Overbought RSI ({rsi:.0f})"}
+
+    # Random/Choppy regime — no edge UNLESS strong momentum + volume override
+    # Crypto and high-momentum movers can still alert if volume + phase confirm
+    if regime in ("RANDOM", "CHOPPY"):
+        has_momentum_override = (
+            phase in ("IGNITION", "ACCELERATION")
+            and rvol >= 2.0
+            and abs(pct) >= 2.0
+        )
+        if not has_momentum_override:
+            return {"confluence_points": 0, "tier": "C", "flags": [],
+                    "suppressed": True, "suppress_reason": f"No edge ({regime} regime)"}
+
+    # Dead volume — nobody participating
+    if rvol < 0.8 and phase not in ("IGNITION", "ACCELERATION"):
+        return {"confluence_points": 0, "tier": "C", "flags": [],
+                "suppressed": True, "suppress_reason": f"Dead volume ({rvol:.1f}x RVOL)"}
+
+    # Low entropy = unpredictable
+    entropy = getattr(pick, "entropy", 0.5)
+    if entropy > 0.85:
+        return {"confluence_points": 0, "tier": "C", "flags": [],
+                "suppressed": True, "suppress_reason": f"Unpredictable (entropy {entropy:.2f})"}
+
+    # ── CONFLUENCE FACTORS (each adds 1 point) ──
+
+    # 1. Trend alignment — regime confirms direction
+    if regime in ("STRONG_TREND", "CLEAN_REVERSION"):
+        points += 1
+        flags.append("Trending regime")
+    elif regime == "NOISY_TREND":
+        points += 0.5
+        flags.append("Weak trend")
+
+    # 2. Momentum phase — IGNITION or ACCELERATION
+    if phase in ("IGNITION", "ACCELERATION"):
+        points += 1
+        flags.append(f"{phase} phase")
+    elif phase == "CRUISE":
+        points += 0.5
+        flags.append("Cruise phase")
+
+    # 3. Volume confirmation — RVOL ≥ 1.5 (normalized for time of day)
+    if rvol >= 2.5:
+        points += 1.5
+        flags.append(f"Strong volume ({rvol:.1f}x)")
+    elif rvol >= 1.5:
+        points += 1
+        flags.append(f"Volume confirmed ({rvol:.1f}x)")
+    elif rvol >= 1.0:
+        points += 0.5
+        flags.append(f"Avg volume ({rvol:.1f}x)")
+
+    # 4. Risk:Reward ≥ 1.5
+    if rr >= 2.5:
+        points += 1.5
+        flags.append(f"R:R {rr:.1f}x")
+    elif rr >= 1.5:
+        points += 1
+        flags.append(f"R:R {rr:.1f}x")
+
+    # 5. ML confidence ≥ 60
+    if ml_conf >= 75:
+        points += 1.5
+        flags.append(f"ML high ({ml_conf:.0f}%)")
+    elif ml_conf >= 60:
+        points += 1
+        flags.append(f"ML good ({ml_conf:.0f}%)")
+    elif ml_conf >= 50:
+        points += 0.5
+        flags.append(f"ML moderate ({ml_conf:.0f}%)")
+
+    # 6. RSI in sweet spot (not extreme — 30-65 for longs, 35-70 for shorts)
+    if pick.direction == "LONG" and 30 <= rsi <= 65:
+        points += 1
+        flags.append(f"RSI sweet spot ({rsi:.0f})")
+    elif pick.direction == "SHORT" and 35 <= rsi <= 70:
+        points += 1
+        flags.append(f"RSI sweet spot ({rsi:.0f})")
+
+    # 7. Score quality
+    if score >= 55:
+        points += 1.5
+        flags.append(f"Strong score ({score:.0f})")
+    elif score >= 45:
+        points += 1
+        flags.append(f"Good score ({score:.0f})")
+    elif score >= 38:
+        points += 0.5
+        flags.append(f"Decent score ({score:.0f})")
+
+    # ── TIER ASSIGNMENT ──
+    # A+: 5+ confluence points — alert always (even dead zone)
+    # A:  3.5+ confluence points — alert during prime + active windows
+    # B:  2+ points — watchlist only, no alert
+    # C:  <2 points — skip entirely
+    if points >= 5:
+        tier = "A+"
+    elif points >= 3.5:
+        tier = "A"
+    elif points >= 2:
+        tier = "B"
+    else:
+        tier = "C"
+
+    return {
+        "confluence_points": points,
+        "tier": tier,
+        "flags": flags,
+        "suppressed": False,
+        "suppress_reason": "",
+    }
+
+
+def classify_setup(pick, rec: dict, asset_class: str = "stocks") -> list:
+    """Classify a scored ticker into trade types using confluence scoring.
+
+    Only returns types for HIGH CONFIDENCE setups:
+    - A+ tier: always alert (any market window)
+    - A tier: alert during prime/active windows only
+    - B/C tier: never alert (watchlist only)
+    """
+    confluence = _compute_confluence(pick, rec)
+
+    # Suppressed — hard kill
+    if confluence["suppressed"]:
+        return []
+
+    tier = confluence["tier"]
+    window = _get_trading_window(asset_class=asset_class)
+
+    # Only A+ and A tiers get alerts
+    if tier == "C" or tier == "B":
+        return []
+
+    # A tier only alerts during prime/active windows (not dead zone)
+    if tier == "A" and window == "dead":
+        return []
+
+    # Closed market — no alerts
+    if window == "closed":
+        return []
+
+    # ── Classify trade type ──
     types = []
     score = pick.composite_score
     signal = rec.get("signal", "HOLD")
+    phase = pick.kinematic_phase
 
-    # DAY TRADE: momentum phase + elevated volume + decent score
-    is_day = (
-        pick.kinematic_phase in ("IGNITION", "ACCELERATION")
-        and pick.rel_volume >= 1.5
-        and score >= 48
-    )
-    if is_day:
+    # DAY TRADE: momentum phase + volume
+    if phase in ("IGNITION", "ACCELERATION") and pick.rel_volume >= 1.5:
         types.append("day_trade")
 
-    # SWING: Trending regime + decent score
-    is_swing = (
-        pick.regime in ("STRONG_TREND", "CLEAN_REVERSION", "NOISY_TREND")
-        and score >= 45
-        and pick.kinematic_phase not in ("IGNITION",)
-    )
-    if is_swing:
+    # SWING: trending regime without ignition
+    if pick.regime in ("STRONG_TREND", "CLEAN_REVERSION", "NOISY_TREND") and phase != "IGNITION":
         types.append("swing")
 
-    # OPTIONS: option available + either signal or high-momentum day trade
+    # If neither day nor swing matched but confluence is high, default to swing
+    if not types and tier == "A+":
+        types.append("swing")
+
+    # OPTIONS: attach if available and signal is clear
     has_option = (
         pick.option_exp_short
         and pick.option_exp_short != "N/A"
-        and score >= 48
+        and score >= 40
     )
     if has_option and signal in ("BUY", "SELL"):
         opt_type = "option_call" if pick.option_direction == "CALL" else "option_put"
         types.append(opt_type)
-    elif has_option and is_day:
+    elif has_option and "day_trade" in types:
         opt_type = "option_call" if pick.direction == "LONG" else "option_put"
         types.append(opt_type)
-    elif has_option and is_swing and score >= 50:
-        # Swing trades with options attached
-        opt_type = "option_call" if pick.option_direction == "CALL" else "option_put"
-        types.append(opt_type)
-
-    # ML confidence filter — only include high-confidence setups
-    ml_conf = compute_ml_confidence(pick)
-    if ml_conf < 45 and not types:
-        return types  # Skip low confidence without any type
 
     return types
 
@@ -264,7 +466,7 @@ def scan_asset_class(asset_class: str) -> dict:
     for pick in picks:
         try:
             rec = get_recommendation(pick)
-            types = classify_setup(pick, rec)
+            types = classify_setup(pick, rec, asset_class=asset_class)
 
             # Log for ML training (features logged now, outcome backfilled later)
             log_training_sample(pick)
@@ -335,12 +537,30 @@ def _send_candlestick_for_pick(pick) -> None:
         log.debug("Candlestick chart failed for %s: %s", getattr(pick, "ticker", "?"), e)
 
 
+_daily_alert_count = {"date": None, "count": 0}
+
+def _check_daily_cap() -> int:
+    """Return remaining alert slots today. Cap: 15 alerts/day."""
+    et = ZoneInfo("America/New_York")
+    today = datetime.datetime.now(et).date()
+    if _daily_alert_count["date"] != today:
+        _daily_alert_count["date"] = today
+        _daily_alert_count["count"] = 0
+    return max(0, 15 - _daily_alert_count["count"])
+
+
 def _dispatch_alerts(results: dict) -> None:
-    """Send categorized alerts to Telegram."""
-    calls = results["option_calls"][:8]
-    puts = results["option_puts"][:5]
-    days = results["day_trades"][:8]
-    swings = results["swings"][:8]
+    """Send categorized alerts to Telegram. Capped to avoid spam."""
+    remaining = _check_daily_cap()
+    if remaining <= 0:
+        log.info("Daily alert cap reached (15) — suppressing all alerts.")
+        return
+
+    # Hard caps per scan: max 2 options, 2 day trades, 3 swings = 7 max
+    calls = results["option_calls"][:2]
+    puts = results["option_puts"][:1]
+    days = results["day_trades"][:2]
+    swings = results["swings"][:3]
 
     total = len(calls) + len(puts) + len(days) + len(swings)
 
@@ -352,6 +572,16 @@ def _dispatch_alerts(results: dict) -> None:
         if now.hour == 9 and now.minute < 45:
             send_telegram(f"{_header()}\n\n😴 No actionable setups this scan.\nMarkets may be quiet — will scan again shortly.")
         return
+
+    # Trim to daily cap
+    total_alerts = len(calls) + len(puts) + len(days) + len(swings)
+    if total_alerts > remaining:
+        # Prioritize: day trades > options > swings
+        budget = remaining
+        days = days[:budget]; budget -= len(days)
+        calls = calls[:max(0,budget)]; budget -= len(calls)
+        puts = puts[:max(0,budget)]; budget -= len(puts)
+        swings = swings[:max(0,budget)]
 
     # ── Option Alerts (calls + puts together) ──
     if calls or puts:
@@ -409,6 +639,9 @@ def _dispatch_alerts(results: dict) -> None:
             _send_candlestick_for_pick(pick)
     else:
         send_telegram(summary)
+
+    # Track daily count
+    _daily_alert_count["count"] += total
 
 
 # ─────────────────────────────────────────────────────────────
