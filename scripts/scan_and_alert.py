@@ -30,6 +30,7 @@ from signals.recommendation import get_recommendation
 from config import settings
 from analysis.ml_confidence import compute_ml_confidence, get_confidence_tier, log_training_sample
 from analysis.position_sizer import format_position_line
+from analysis.options_math import compute_option_probabilities
 from signals.chart_generator import generate_alert_chart, generate_summary_chart, generate_candlestick_chart
 
 logging.basicConfig(
@@ -51,7 +52,7 @@ def _header() -> str:
 
 
 def _format_option_alert(pick, rec: dict) -> str:
-    """Format an options play alert (CALL or PUT)."""
+    """Format an options play alert (CALL or PUT) with Black-Scholes probabilities."""
     direction = pick.option_direction or "CALL"
     emoji = "🟢" if direction == "CALL" else "🔴"
     strike = pick.option_safe_strike or pick.price
@@ -62,6 +63,12 @@ def _format_option_alert(pick, rec: dict) -> str:
     # ML confidence
     ml_conf = compute_ml_confidence(pick)
     ml_tier = get_confidence_tier(ml_conf)
+
+    # Black-Scholes probability
+    bs = compute_option_probabilities(pick)
+    bs_line = ""
+    if bs.get("safe_prob_itm"):
+        bs_line = f"\n   P(ITM): {bs['safe_prob_itm']:.0f}%  |  Δ: {bs['safe_delta']:.2f}  |  IV: {bs.get('iv_est', 0):.0f}%"
 
     # Support/resistance context
     levels = ""
@@ -89,7 +96,7 @@ def _format_option_alert(pick, rec: dict) -> str:
         f"   Price: <code>${pick.price:.2f}</code> ({pick.pct_change:+.1f}%)  |  Confidence: {conf}%\n"
         f"   Regime: {pick.regime}  |  Phase: {pick.kinematic_phase}  |  RVOL: {pick.rel_volume:.1f}x\n"
         f"   ML Confidence: {ml_tier} ({ml_conf:.0f}%)"
-        f"{levels}{rr}{pos_line}"
+        f"{bs_line}{levels}{rr}{pos_line}"
     )
     if reasons_str:
         base += f"\n{reasons_str}"

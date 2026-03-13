@@ -53,6 +53,9 @@ class ScoredTicker:
     option_exp_short: str = ""
     option_exp_long: str = ""
     option_budget: str = ""
+    option_prob_itm: float = 0       # Black-Scholes P(ITM) %
+    option_delta: float = 0          # Black-Scholes Delta
+    option_iv_est: float = 0         # Estimated implied volatility %
     # Levels
     nearest_support: float = 0
     nearest_resistance: float = 0

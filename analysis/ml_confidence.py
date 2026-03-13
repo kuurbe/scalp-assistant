@@ -274,6 +274,24 @@ def _heuristic_confidence(scored_ticker) -> float:
         elif abs(pct) > 10:
             confidence -= 8  # Chasing
 
+        # Black-Scholes probability boost (0-8 pts)
+        # If option play exists, use BS P(ITM) to validate the trade direction
+        try:
+            from analysis.options_math import compute_option_probabilities
+            bs = compute_option_probabilities(scored_ticker)
+            prob_itm = bs.get("safe_prob_itm", 0)
+            if prob_itm > 0:
+                if 40 <= prob_itm <= 70:
+                    confidence += 8    # Sweet spot: good odds, not fully priced in
+                elif 25 <= prob_itm < 40:
+                    confidence += 4    # Decent odds for OTM
+                elif prob_itm > 70:
+                    confidence += 3    # High prob but expensive premium
+                elif prob_itm < 15:
+                    confidence -= 5    # Lottery ticket, low edge
+        except Exception:
+            pass
+
         return float(np.clip(confidence, 0, 100))
 
     except Exception:
