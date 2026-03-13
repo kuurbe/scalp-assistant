@@ -111,13 +111,15 @@ def _analyze_ticker(ticker: str, macro_regime: str, reddit_data: dict, short_dat
         prev = float(close.iloc[-2]) if len(close) > 1 else price
         pct_change = ((price - prev) / prev) * 100 if prev > 0 else 0
         vol = float(daily["Volume"].iloc[-1])
-        avg_vol = float(daily["Volume"].iloc[:-1].mean()) if len(daily) > 1 else vol
+        # Use 20-day average volume (excluding today) for relative volume
+        recent_vol = daily["Volume"].iloc[-21:-1] if len(daily) > 21 else daily["Volume"].iloc[:-1]
+        avg_vol = float(recent_vol.mean()) if len(recent_vol) > 0 else vol
         rel_volume = vol / avg_vol if avg_vol > 0 else 0
 
         # Skip low-activity tickers (forex/crypto have no volume data)
         if price < 1:
             return None
-        if asset_class not in ("forex", "crypto") and rel_volume < 0.3:
+        if asset_class not in ("forex", "crypto") and rel_volume < 0.1:
             return None
         # For forex/crypto, default rel_volume to 1.0 when no volume data
         if rel_volume == 0 and asset_class in ("forex", "crypto"):

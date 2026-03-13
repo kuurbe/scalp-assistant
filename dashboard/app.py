@@ -82,7 +82,6 @@ with st.sidebar:
             "Macro",
             "Events",
             "ML Predictions",
-            "Predictions",
             "Alerts",
         ],
         label_visibility="collapsed",
@@ -143,7 +142,6 @@ page_map = {
     "Macro": "dashboard.pages.macro",
     "Events": "dashboard.pages.events",
     "ML Predictions": "dashboard.pages.ml_predictions",
-    "Predictions": "dashboard.pages.predictions",
     "Alerts": "dashboard.pages.alerts",
 }
 

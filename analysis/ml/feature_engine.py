@@ -67,7 +67,7 @@ def compute_ema_ribbon(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     close = out["Close"].astype(float)
 
-    if len(close) < 200:
+    if len(close) < 30:
         for col in _EMA_COLS:
             out[col] = 0.0
         return out

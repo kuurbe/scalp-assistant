@@ -254,7 +254,7 @@ def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "univ
         # Get data if not provided
         if df is None:
             import yfinance as yf
-            df = yf.download(ticker, period="120d", progress=False)
+            df = yf.download(ticker, period="1y", progress=False)
             if df is None or len(df) < 30:
                 return _empty_prediction()
             if isinstance(df.columns, pd.MultiIndex):
