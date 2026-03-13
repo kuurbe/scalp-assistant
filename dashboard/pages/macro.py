@@ -1,5 +1,8 @@
 """
 Macro page — FRED data, yield curve, VIX, rates, inflation, employment.
+
+Simple mode: 4 key metrics + plain English narrative.
+Advanced mode: full economic indicators, commodity prices, bar chart.
 """
 import streamlit as st
 from dashboard.theme import COLORS, CARD_CSS
@@ -9,24 +12,111 @@ from dashboard import data_bridge
 
 
 def render():
+    is_simple = st.session_state.get("view_mode", "Simple") == "Simple"
+
+    subtitle = "The big picture — what's happening in the economy" if is_simple else "FRED economic data — rates, yields, inflation, employment"
+
     st.markdown(f"""
     <div style="font-size:34px; font-weight:700; color:{COLORS['text']};
                 letter-spacing:-0.02em; margin-bottom:8px;">
-        Macro Dashboard
+        {"Economy Overview" if is_simple else "Macro Dashboard"}
     </div>
     <div style="font-size:15px; color:{COLORS['text_muted']}; margin-bottom:32px;">
-        FRED economic data — rates, yields, inflation, employment
+        {subtitle}
     </div>
     """, unsafe_allow_html=True)
 
-    # Fetch macro data
     macro = data_bridge.get_macro_context()
     expanded = data_bridge.get_expanded_macro()
 
-    # ─── Key Metrics Row ───
     vix = macro.get("vix", 0)
     regime = macro.get("macro_regime", "NEUTRAL")
 
+    if is_simple:
+        _render_simple(vix, regime, expanded)
+    else:
+        _render_advanced(vix, regime, expanded)
+
+
+def _render_simple(vix, regime, expanded):
+    # ─── 4 key metric cards ───
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        vix_label = "High" if vix and vix > 25 else ("Elevated" if vix and vix > 20 else "Normal")
+        vix_color = COLORS["danger"] if vix and vix > 25 else (COLORS["warning"] if vix and vix > 20 else COLORS["success"])
+        st.markdown(f"""<div style="{CARD_CSS} text-align:center; padding:20px;">
+            <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase; letter-spacing:0.06em;">MARKET FEAR</div>
+            <div style="font-size:30px; font-weight:700; color:{vix_color}; margin-top:8px;">{vix_label}</div>
+            <div style="font-size:13px; color:{COLORS['text_dim']}; margin-top:4px;">VIX: {vix:.1f}</div>
+        </div>""", unsafe_allow_html=True)
+
+    with c2:
+        regime_color = COLORS["success"] if regime == "EXPANSION" else (COLORS["danger"] if regime == "CONTRACTION" else COLORS["warning"])
+        regime_label = {"EXPANSION": "Growing", "CONTRACTION": "Slowing", "NEUTRAL": "Steady"}.get(regime, regime)
+        st.markdown(f"""<div style="{CARD_CSS} text-align:center; padding:20px;">
+            <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase; letter-spacing:0.06em;">ECONOMY</div>
+            <div style="font-size:30px; font-weight:700; color:{regime_color}; margin-top:8px;">{regime_label}</div>
+            <div style="font-size:13px; color:{COLORS['text_dim']}; margin-top:4px;">Macro regime</div>
+        </div>""", unsafe_allow_html=True)
+
+    with c3:
+        fed_rate = expanded.get("fed_rate", "—")
+        st.markdown(f"""<div style="{CARD_CSS} text-align:center; padding:20px;">
+            <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase; letter-spacing:0.06em;">INTEREST RATES</div>
+            <div style="font-size:30px; font-weight:700; color:{COLORS['text']}; margin-top:8px;">{fed_rate}%</div>
+            <div style="font-size:13px; color:{COLORS['text_dim']}; margin-top:4px;">Fed Funds Rate</div>
+        </div>""", unsafe_allow_html=True)
+
+    with c4:
+        yc = expanded.get("yield_curve_spread", "—")
+        if isinstance(yc, (int, float)):
+            yc_color = COLORS["danger"] if yc < 0 else COLORS["success"]
+            yc_label = "Inverted" if yc < 0 else "Normal"
+            yc_display = f"{yc:.2f}"
+        else:
+            yc_color = COLORS["text_dim"]
+            yc_label = ""
+            yc_display = "—"
+        st.markdown(f"""<div style="{CARD_CSS} text-align:center; padding:20px;">
+            <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase; letter-spacing:0.06em;">YIELD CURVE</div>
+            <div style="font-size:30px; font-weight:700; color:{yc_color}; margin-top:8px;">{yc_label if yc_label else yc_display}</div>
+            <div style="font-size:13px; color:{COLORS['text_dim']}; margin-top:4px;">10Y-2Y: {yc_display}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ─── What it means narrative ───
+    points = []
+    if vix and isinstance(vix, (int, float)):
+        if vix > 25:
+            points.append("Markets are fearful right now (VIX is high). Expect bigger price swings and be cautious with new positions.")
+        elif vix > 20:
+            points.append("There's some nervousness in the market (VIX is elevated). Keep an eye on things but don't panic.")
+        else:
+            points.append("Markets are calm right now (VIX is low). This is usually a good environment for steady gains.")
+
+    if isinstance(yc, (int, float)):
+        if yc < 0:
+            points.append("The yield curve is inverted — historically this has been a warning sign for the economy. Stay defensive.")
+        else:
+            points.append("The yield curve is normal, which suggests the economy is on stable footing.")
+
+    if regime == "CONTRACTION":
+        points.append("The economy appears to be slowing. Defensive stocks and bonds may outperform.")
+    elif regime == "EXPANSION":
+        points.append("The economy is growing. Growth and cyclical stocks tend to do well in this environment.")
+
+    if points:
+        narrative = " ".join(points)
+        border_color = COLORS["success"] if vix and vix < 20 and regime == "EXPANSION" else (COLORS["danger"] if vix and vix > 25 else COLORS["warning"])
+        st.markdown(f"""<div style="{CARD_CSS} border-left:4px solid {border_color}; padding:20px;">
+            <div style="font-size:16px; font-weight:600; color:{COLORS['text']}; margin-bottom:8px;">What does this mean for your trades?</div>
+            <div style="font-size:14px; color:{COLORS['text_secondary']}; line-height:1.7;">{narrative}</div>
+        </div>""", unsafe_allow_html=True)
+
+
+def _render_advanced(vix, regime, expanded):
+    # ─── Key Metrics Row ───
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         vix_label = "HIGH" if vix and vix > 25 else ("ELEVATED" if vix and vix > 20 else "NORMAL")

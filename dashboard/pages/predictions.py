@@ -1,5 +1,8 @@
 """
 Predictions page — prediction log, accuracy metrics, calibration, achievements.
+
+Simple mode: Win rate + streak + earned achievements only.
+Advanced mode: full breakdown by score range, regime, asset class + locked achievements.
 """
 import streamlit as st
 from dashboard.theme import COLORS, CARD_CSS
@@ -10,26 +13,107 @@ from dashboard import data_bridge
 
 
 def render():
+    is_simple = st.session_state.get("view_mode", "Simple") == "Simple"
+
+    subtitle = "How accurate are the predictions?" if is_simple else "Prediction accuracy, calibration, and achievement tracking"
+
     st.markdown(f"""
     <div style="font-size:34px; font-weight:700; color:{COLORS['text']};
                 letter-spacing:-0.02em; margin-bottom:8px;">
         Predictions
     </div>
     <div style="font-size:15px; color:{COLORS['text_muted']}; margin-bottom:32px;">
-        Prediction accuracy, calibration, and achievement tracking
+        {subtitle}
     </div>
     """, unsafe_allow_html=True)
 
-    # Fetch accuracy data
     accuracy = data_bridge.get_prediction_accuracy()
     achievements = data_bridge.get_achievements()
 
-    # ─── Accuracy Overview ───
     win_rate = accuracy.get("overall_win_rate", 0)
     total = accuracy.get("total_evaluated", 0)
     streak = accuracy.get("current_streak", 0)
     max_streak = accuracy.get("max_streak", 0)
 
+    if is_simple:
+        _render_simple(win_rate, total, streak, max_streak, accuracy, achievements)
+    else:
+        _render_advanced(win_rate, total, streak, max_streak, accuracy, achievements)
+
+
+def _render_simple(win_rate, total, streak, max_streak, accuracy, achievements):
+    # ─── Two big cards: Win Rate + Streak ───
+    c1, c2 = st.columns(2)
+
+    with c1:
+        wr_color = COLORS["success"] if win_rate >= 55 else (COLORS["warning"] if win_rate >= 45 else COLORS["danger"])
+        wr_label = "Great" if win_rate >= 60 else ("Good" if win_rate >= 55 else ("Fair" if win_rate >= 45 else "Needs work"))
+        st.markdown(f"""<div style="{CARD_CSS} text-align:center; padding:32px;">
+            <div style="font-size:12px; color:{COLORS['text_muted']}; text-transform:uppercase; letter-spacing:0.06em;">YOUR ACCURACY</div>
+            <div style="font-size:48px; font-weight:700; color:{wr_color}; margin-top:12px;">{win_rate:.0f}%</div>
+            <div style="font-size:14px; color:{COLORS['text_secondary']}; margin-top:8px;">{wr_label} — {total} predictions evaluated</div>
+        </div>""", unsafe_allow_html=True)
+
+    with c2:
+        streak_color = COLORS["success"] if streak > 0 else COLORS["text_dim"]
+        streak_label = f"{streak} wins in a row" if streak > 0 else "No active streak"
+        st.markdown(f"""<div style="{CARD_CSS} text-align:center; padding:32px;">
+            <div style="font-size:12px; color:{COLORS['text_muted']}; text-transform:uppercase; letter-spacing:0.06em;">CURRENT STREAK</div>
+            <div style="font-size:48px; font-weight:700; color:{streak_color}; margin-top:12px;">{streak}</div>
+            <div style="font-size:14px; color:{COLORS['text_secondary']}; margin-top:8px;">{streak_label} (best: {max_streak})</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ─── What this means ───
+    if total > 0:
+        if win_rate >= 55:
+            msg = "The model is performing well — it's getting the direction right more often than not. Higher scores tend to produce better picks."
+        elif win_rate >= 45:
+            msg = "The model is performing about average. Results improve over time as more data is collected. Stick to higher-confidence signals."
+        else:
+            msg = "The model is still learning from recent market conditions. Consider waiting for higher-confidence signals before acting."
+        msg_color = COLORS["success"] if win_rate >= 55 else (COLORS["warning"] if win_rate >= 45 else COLORS["danger"])
+
+        st.markdown(f"""<div style="{CARD_CSS} border-left:4px solid {msg_color}; padding:16px 20px;">
+            <div style="font-size:16px; font-weight:600; color:{COLORS['text']}; margin-bottom:6px;">What does this mean?</div>
+            <div style="font-size:14px; color:{COLORS['text_secondary']}; line-height:1.6;">{msg}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ─── Earned achievements only ───
+    if achievements:
+        earned = [a for a in achievements if a.get("earned", False)]
+        if earned:
+            st.markdown(f"""
+            <div style="font-size:22px; font-weight:600; color:{COLORS['text']}; margin-bottom:16px;">
+                Your Achievements
+            </div>
+            <div style="font-size:13px; color:{COLORS['text_muted']}; margin-bottom:12px;">
+                {len(earned)} of {len(achievements)} unlocked
+            </div>
+            """, unsafe_allow_html=True)
+
+            cols = st.columns(min(len(earned), 4))
+            for i, ach in enumerate(earned):
+                tier = ach.get("tier", "BRONZE")
+                tier_colors = {"BRONZE": "#CD7F32", "SILVER": "#C0C0C0", "GOLD": "#FFD700", "PLATINUM": "#E5E4E2"}
+                tc = tier_colors.get(tier, COLORS["accent"])
+                tier_emoji = {"BRONZE": "3rd", "SILVER": "2nd", "GOLD": "1st", "PLATINUM": "top"}
+                with cols[i % len(cols)]:
+                    st.markdown(f"""
+                    <div style="{CARD_CSS} text-align:center; padding:20px; border:1px solid {tc}30;">
+                        <div style="font-size:14px; color:{COLORS['text']}; font-weight:500;">
+                            {ach.get("name", "Achievement")}</div>
+                        <div style="font-size:12px; color:{COLORS['text_muted']}; margin-top:4px;">
+                            {ach.get("description", "")[:60]}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+
+def _render_advanced(win_rate, total, streak, max_streak, accuracy, achievements):
+    # ─── 4 metric cards ───
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         wr_color = COLORS["success"] if win_rate >= 55 else (COLORS["warning"] if win_rate >= 45 else COLORS["danger"])
@@ -45,7 +129,7 @@ def render():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ─── Win Rate Gauge ───
+    # ─── Win Rate Gauge + Breakdown ───
     col_gauge, col_breakdown = st.columns([1, 2])
 
     with col_gauge:
@@ -58,7 +142,6 @@ def render():
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col_breakdown:
-        # Accuracy by score range
         by_score = accuracy.get("by_score_range", {})
         if by_score:
             st.markdown(f"""
@@ -142,16 +225,10 @@ def render():
             </div>
             """, unsafe_allow_html=True)
 
-            # Achievement grid
             cols = st.columns(min(len(earned), 4))
             for i, ach in enumerate(earned):
                 tier = ach.get("tier", "BRONZE")
-                tier_colors = {
-                    "BRONZE": "#CD7F32",
-                    "SILVER": "#C0C0C0",
-                    "GOLD": "#FFD700",
-                    "PLATINUM": "#E5E4E2",
-                }
+                tier_colors = {"BRONZE": "#CD7F32", "SILVER": "#C0C0C0", "GOLD": "#FFD700", "PLATINUM": "#E5E4E2"}
                 tc = tier_colors.get(tier, COLORS["accent"])
                 with cols[i % len(cols)]:
                     st.markdown(f"""
@@ -166,7 +243,6 @@ def render():
                     </div>
                     """, unsafe_allow_html=True)
 
-        # Locked achievements
         if locked:
             with st.expander(f"Locked Achievements ({len(locked)})"):
                 for ach in locked:

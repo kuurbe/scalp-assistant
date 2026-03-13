@@ -1,6 +1,9 @@
 """
 ML Predictions page — Walk-forward validated ML forecasts, confidence intervals,
 backtesting with per-fold metrics, and feature importance.
+
+Simple mode: beginner-friendly 3-card view with plain English explainer.
+Advanced mode: full technical detail with backtest, CI, features, re-train.
 """
 
 import streamlit as st
@@ -107,7 +110,6 @@ def _run_backtest(ticker: str):
     ss_tot = np.sum((all_actual_ret - np.mean(all_actual_ret)) ** 2)
     wf_r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-    # Feature importances from full-data model
     scaler_full = StandardScaler()
     X_full = scaler_full.fit_transform(X)
     clf_full = GradientBoostingClassifier(
@@ -182,13 +184,17 @@ def _bootstrap_confidence(ticker: str, n_bootstraps: int = 30):
 # ── Render ──────────────────────────────────────────────────────────────────
 
 def render():
+    is_simple = st.session_state.get("view_mode", "Simple") == "Simple"
+
+    subtitle = "What the AI model thinks will happen next" if is_simple else "Walk-forward validated forecasts with confidence intervals &amp; feature analysis"
+
     st.markdown(f"""
     <div style="font-size:34px; font-weight:700; color:{COLORS['text']};
                 letter-spacing:-0.02em; margin-bottom:4px;">
         ML Predictions
     </div>
     <div style="font-size:15px; color:{COLORS['text_muted']}; margin-bottom:28px;">
-        Walk-forward validated forecasts with confidence intervals &amp; feature analysis
+        {subtitle}
     </div>
     """, unsafe_allow_html=True)
 
@@ -200,7 +206,7 @@ def render():
 
     col_ticker, col_custom = st.columns([2, 1])
     with col_ticker:
-        selected = st.selectbox("Select Ticker", all_tickers, index=0)
+        selected = st.selectbox("Select Ticker" if not is_simple else "Pick a stock", all_tickers, index=0)
     with col_custom:
         custom = st.text_input("Or enter any ticker", value="", placeholder="e.g. COIN")
 
@@ -216,7 +222,6 @@ def render():
         st.warning(f"Not enough data for {ticker}. Try a different ticker.")
         return
 
-    # ─── Top metrics row ───
     pred_ret = prediction.get("predicted_return", 0)
     confidence = prediction.get("confidence", 0)
     direction = prediction.get("direction", "NEUTRAL")
@@ -225,8 +230,100 @@ def render():
     current_price = float(df["Close"].iloc[-1])
 
     dir_color = COLORS["success"] if direction == "BULL" else (COLORS["danger"] if direction == "BEAR" else COLORS["warning"])
+
+    if is_simple:
+        _render_simple(ticker, prediction, df, pred_ret, confidence, direction, ml_score, bull_prob, current_price, dir_color)
+    else:
+        _render_advanced(ticker, prediction, df, pred_ret, confidence, direction, ml_score, bull_prob, current_price, dir_color)
+
+
+# ── SIMPLE MODE ─────────────────────────────────────────────────────────────
+
+def _render_simple(ticker, prediction, df, pred_ret, confidence, direction, ml_score, bull_prob, current_price, dir_color):
+    # Friendly direction labels
+    dir_labels = {"BULL": "Leaning Up", "BEAR": "Leaning Down", "NEUTRAL": "Undecided"}
+    dir_icons = {"BULL": "^", "BEAR": "v", "NEUTRAL": "-"}
+    friendly_dir = dir_labels.get(direction, "Undecided")
+
+    # ─── 3 simple metric cards ───
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown(f"""<div style="{CARD_CSS} text-align:center; padding:24px;">
+            <div style="font-size:12px; color:{COLORS['text_muted']}; text-transform:uppercase; letter-spacing:0.06em;">DIRECTION</div>
+            <div style="font-size:30px; font-weight:700; color:{dir_color}; margin-top:10px;">{dir_icons[direction]} {friendly_dir}</div>
+            <div style="font-size:13px; color:{COLORS['text_dim']}; margin-top:6px;">Where the model thinks {ticker} is heading</div>
+        </div>""", unsafe_allow_html=True)
+
+    with c2:
+        conf_color = COLORS["success"] if confidence >= 70 else (COLORS["warning"] if confidence >= 40 else COLORS["danger"])
+        conf_label = "High" if confidence >= 70 else ("Moderate" if confidence >= 40 else "Low")
+        st.markdown(f"""<div style="{CARD_CSS} text-align:center; padding:24px;">
+            <div style="font-size:12px; color:{COLORS['text_muted']}; text-transform:uppercase; letter-spacing:0.06em;">HOW SURE IS THE MODEL?</div>
+            <div style="font-size:30px; font-weight:700; color:{conf_color}; margin-top:10px;">{conf_label}</div>
+            <div style="font-size:13px; color:{COLORS['text_dim']}; margin-top:6px;">{confidence:.0f}% confidence</div>
+        </div>""", unsafe_allow_html=True)
+
+    with c3:
+        score_color = COLORS["success"] if ml_score >= 65 else (COLORS["warning"] if ml_score >= 40 else COLORS["danger"])
+        score_label = "Strong" if ml_score >= 65 else ("Fair" if ml_score >= 40 else "Weak")
+        st.markdown(f"""<div style="{CARD_CSS} text-align:center; padding:24px;">
+            <div style="font-size:12px; color:{COLORS['text_muted']}; text-transform:uppercase; letter-spacing:0.06em;">SIGNAL STRENGTH</div>
+            <div style="font-size:30px; font-weight:700; color:{score_color}; margin-top:10px;">{score_label}</div>
+            <div style="font-size:13px; color:{COLORS['text_dim']}; margin-top:6px;">Score: {ml_score:.0f} / 100</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ─── Plain English explainer card ───
+    target_price = current_price * (1 + pred_ret / 100)
+    if direction == "BULL" and confidence >= 50:
+        advice = f"The model sees bullish signals for {ticker}. It predicts a move to around ${target_price:.2f} ({pred_ret:+.2f}%). This could be a good time to watch for entry points."
+        advice_color = COLORS["success"]
+    elif direction == "BEAR" and confidence >= 50:
+        advice = f"The model is cautious on {ticker}. It predicts a possible dip to around ${target_price:.2f} ({pred_ret:+.2f}%). Consider being patient or protecting existing positions."
+        advice_color = COLORS["danger"]
+    else:
+        advice = f"The model doesn't have a strong opinion on {ticker} right now. The predicted move is small ({pred_ret:+.2f}%). It may be best to wait for a clearer setup."
+        advice_color = COLORS["warning"]
+
+    st.markdown(f"""<div style="{CARD_CSS} border-left:4px solid {advice_color}; padding:20px;">
+        <div style="font-size:16px; font-weight:600; color:{COLORS['text']}; margin-bottom:8px;">What does this mean?</div>
+        <div style="font-size:14px; color:{COLORS['text_secondary']}; line-height:1.6;">{advice}</div>
+    </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ─── Chart + forecast (same as advanced, visual and easy to read) ───
+    col_chart, col_forecast = st.columns([3, 1])
+
+    with col_chart:
+        st.markdown(f"""<div style="font-size:18px; font-weight:600; color:{COLORS['text']}; margin-bottom:12px;">Price Chart &amp; Forecast</div>""", unsafe_allow_html=True)
+        _render_candlestick(df, prediction, ticker)
+
+    with col_forecast:
+        st.markdown(f"""<div style="font-size:18px; font-weight:600; color:{COLORS['text']}; margin-bottom:12px;">10-Day Outlook</div>""", unsafe_allow_html=True)
+        forecast = prediction.get("forecast_10d", [])
+        if forecast:
+            for day_data in forecast:
+                day_num = day_data.get("day", 0)
+                avg_pred = day_data.get("avg_pred", 0)
+                pct = ((avg_pred - current_price) / current_price) * 100
+                pct_color = COLORS["success"] if pct > 0 else COLORS["danger"]
+                st.markdown(f"""<div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid {COLORS['border_light']};">
+                    <span style="font-size:13px; color:{COLORS['text_secondary']};">Day {day_num}</span>
+                    <span style="font-size:13px; font-weight:500; color:{pct_color};">${avg_pred:.2f} ({pct:+.1f}%)</span>
+                </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<div style='color:{COLORS['text_dim']}; font-size:13px;'>No forecast data</div>", unsafe_allow_html=True)
+
+
+# ── ADVANCED MODE ───────────────────────────────────────────────────────────
+
+def _render_advanced(ticker, prediction, df, pred_ret, confidence, direction, ml_score, bull_prob, current_price, dir_color):
     dir_icon = "^" if direction == "BULL" else ("v" if direction == "BEAR" else "-")
 
+    # ─── Top metrics row (5 cards) ───
     c1, c2, c3, c4, c5 = st.columns(5)
 
     with c1:
@@ -352,7 +449,6 @@ def render():
                 </div>
             </div>""", unsafe_allow_html=True)
 
-            # Per-fold results
             folds = bt.get("fold_results", [])
             if folds:
                 st.markdown(f"""<div style="font-size:14px; font-weight:600; color:{COLORS['text']}; margin:12px 0 8px 0;">Per-Fold Results</div>""", unsafe_allow_html=True)
@@ -364,7 +460,6 @@ def render():
                         <span style="color:{hit_c}; font-weight:600;">{f['hit_rate']}%</span>
                     </div>""", unsafe_allow_html=True)
 
-            # Actual vs predicted chart
             _render_backtest_chart(bt)
         else:
             st.markdown(f"""<div style="{CARD_CSS} text-align:center; color:{COLORS['text_dim']}; padding:40px;">Not enough data for backtest</div>""", unsafe_allow_html=True)
