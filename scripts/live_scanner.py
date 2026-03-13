@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import time
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -33,10 +34,12 @@ log = logging.getLogger("live_scanner")
 
 
 def is_market_hours() -> bool:
-    """Check if US markets are open (9:00 AM - 4:30 PM ET, Mon-Fri)."""
+    """Check if US markets are open (9:00 AM - 4:30 PM ET, Mon-Fri).
+
+    Uses America/New_York timezone to automatically handle EST/EDT transitions.
+    """
     try:
-        from datetime import timezone, timedelta
-        et = timezone(timedelta(hours=-5))  # EST (close enough for trading hours)
+        et = ZoneInfo("America/New_York")
         now = datetime.datetime.now(et)
         weekday = now.weekday()  # Mon=0, Sun=6
         hour = now.hour
@@ -44,20 +47,22 @@ def is_market_hours() -> bool:
 
         if weekday >= 5:
             return False  # Weekend
-        if hour < 9 or (hour == 9 and minute < 0):
-            return False  # Before 9 AM
+        if hour < 9:
+            return False  # Before 9 AM ET
         if hour > 16 or (hour == 16 and minute > 30):
-            return False  # After 4:30 PM
+            return False  # After 4:30 PM ET
         return True
     except Exception:
         return True  # Default to scanning if timezone calc fails
 
 
 def is_crypto_hours() -> bool:
-    """Crypto trades 24/7 but we limit scans to avoid noise."""
+    """Crypto trades 24/7 but we limit scans to avoid noise.
+
+    Uses America/New_York timezone to automatically handle EST/EDT transitions.
+    """
     try:
-        from datetime import timezone, timedelta
-        et = timezone(timedelta(hours=-5))
+        et = ZoneInfo("America/New_York")
         now = datetime.datetime.now(et)
         # Skip 1 AM - 5 AM ET (lowest volume, least actionable)
         return not (1 <= now.hour < 5)

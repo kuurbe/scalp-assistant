@@ -5,6 +5,7 @@ Controls when and how notifications are dispatched.
 import datetime
 import logging
 import os
+from zoneinfo import ZoneInfo
 
 from config import settings
 
@@ -163,7 +164,8 @@ def _is_quiet_hours() -> bool:
             return False
 
         start_hour, end_hour = quiet
-        current_hour = datetime.datetime.now().hour
+        et = ZoneInfo("America/New_York")
+        current_hour = datetime.datetime.now(et).hour
 
         # Handle overnight range (e.g., 22 to 7)
         if start_hour > end_hour:

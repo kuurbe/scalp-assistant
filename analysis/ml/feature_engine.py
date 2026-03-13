@@ -1,16 +1,13 @@
 """
-ML Feature Engine — Kinematics + Volatility + Momentum + Cross-Asset feature pipeline.
+ML Feature Engine — Saty-Framework Feature Pipeline.
 
-Generates features per ticker from raw OHLCV data:
-  - Linear regression (velocity, r², trend direction)
-  - Kinematic quadratic (acceleration, residuals)
-  - Momentum (5/10/20-day returns, daily % change)
-  - Rolling stats (5/10/20 day mean, std)
-  - Derived force (mean deviation, z-score)
-  - Regime indicator (60-day trend direction)
-  - Cross-asset (VIX level, VIX change, TLT return — fetched once, cached)
-  - Volatility ensembles (Yang-Zhang, GJR-GARCH proxy, HAR-RV, LPV, super hybrid)
-  - Volume-price (OBV slope, VWAP deviation)
+Generates features per ticker from raw OHLCV data based on Saty indicator concepts:
+  - ATR Levels: volatility-normalized price positioning
+  - EMA Ribbon: 5-EMA trend system (8, 13, 21, 48, 200) with crossover signals
+  - Phase Oscillator: ATR/EMA-based Wyckoff phase zones + compression detection
+  - Volume Stack: Buy/sell volume proxy from candle structure
+  - Cross-asset context: VIX, TLT (fetched once, cached)
+  - Momentum/regime: returns + z-score
 
 Includes trend validation via ADF stationarity tests.
 """
@@ -20,89 +17,224 @@ import pandas as pd
 from scipy import stats
 
 
-# ── 1. KINEMATICS FEATURES ─────────────────────────────────────────────────
+# ── 1. ATR FEATURES ───────────────────────────────────────────────────────
 
-def compute_kinematic_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute linear regression + quadratic fit features from close prices."""
+def compute_atr_features(df: pd.DataFrame) -> pd.DataFrame:
+    """ATR-based features: volatility level, price vs pivot, target distance."""
     out = df.copy()
-    close = out["Close"].values.astype(float)
-    t = np.arange(len(close))
+    n = len(out)
 
-    if len(close) < 10:
-        for col in _KINEMATIC_COLS:
+    if n < 15:
+        for col in _ATR_COLS:
             out[col] = 0.0
         return out
 
-    slope, intercept, r_value, p_value, std_err = stats.linregress(t, close)
-    out["linear_velocity"] = slope
-    out["linear_residual"] = close - (slope * t + intercept)
-    out["r_squared"] = r_value ** 2
-    out["trend_direction"] = np.sign(slope)
+    high = out["High"].astype(float)
+    low = out["Low"].astype(float)
+    close = out["Close"].astype(float)
+    prev_close = close.shift(1)
 
-    coeffs = np.polyfit(t, close, 2)
-    out["acceleration"] = 2 * coeffs[0]
-    out["quad_residual"] = close - np.polyval(coeffs, t)
+    # True Range → ATR(14) via Wilder's smoothing
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
+
+    out["atr_14"] = atr
+
+    # ATR as % of price (volatility-normalized — scale-invariant)
+    out["atr_pct"] = (atr / close.replace(0, np.nan)).fillna(0) * 100
+
+    # Price vs central pivot (prior close) in ATR units
+    pivot = prev_close
+    out["price_vs_pivot"] = ((close - pivot) / atr.replace(0, np.nan)).fillna(0)
+
+    # Distance to 1x ATR extension (how far from a full-ATR move)
+    out["atr_target_dist"] = ((close - pivot).abs() / atr.replace(0, np.nan)).fillna(0)
 
     return out
 
 
-_KINEMATIC_COLS = [
-    "linear_velocity", "linear_residual", "r_squared",
-    "trend_direction", "acceleration", "quad_residual",
+_ATR_COLS = ["atr_14", "atr_pct", "price_vs_pivot", "atr_target_dist"]
+
+
+# ── 2. EMA RIBBON FEATURES ───────────────────────────────────────────────
+
+def compute_ema_ribbon(df: pd.DataFrame) -> pd.DataFrame:
+    """5-EMA ribbon (8, 13, 21, 48, 200) with crossover and slope signals."""
+    out = df.copy()
+    close = out["Close"].astype(float)
+
+    if len(close) < 200:
+        for col in _EMA_COLS:
+            out[col] = 0.0
+        return out
+
+    ema8 = close.ewm(span=8, adjust=False).mean()
+    ema13 = close.ewm(span=13, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema48 = close.ewm(span=48, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+
+    # Get ATR for normalization (use atr_14 if already computed, else compute)
+    if "atr_14" in out.columns:
+        atr = out["atr_14"]
+    else:
+        high = out["High"].astype(float)
+        low = out["Low"].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low, (high - prev_close).abs(), (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
+
+    safe_atr = atr.replace(0, np.nan)
+
+    # Ribbon spread: (EMA8 - EMA200) / ATR — overall trend strength
+    out["ema_ribbon_spread"] = ((ema8 - ema200) / safe_atr).fillna(0)
+
+    # EMA 8/13 cross: fast trend direction (+1 bull, -1 bear)
+    out["ema_8_13_cross"] = np.sign(ema8 - ema13).fillna(0)
+
+    # EMA 13/48 cross: conviction arrow proxy
+    out["ema_13_48_cross"] = np.sign(ema13 - ema48).fillna(0)
+
+    # EMA21 slope: 5-bar rate of change of EMA21 (trend speed)
+    out["ema_slope_21"] = (ema21.diff(5) / safe_atr).fillna(0)
+
+    # Price vs EMA21 in ATR units (pullback/extension)
+    out["price_vs_ema21"] = ((close - ema21) / safe_atr).fillna(0)
+
+    return out
+
+
+_EMA_COLS = [
+    "ema_ribbon_spread", "ema_8_13_cross", "ema_13_48_cross",
+    "ema_slope_21", "price_vs_ema21",
 ]
 
 
-# ── 2. MOMENTUM + REGIME FEATURES ──────────────────────────────────────────
+# ── 3. PHASE OSCILLATOR FEATURES ─────────────────────────────────────────
 
-def compute_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute rate of change, rolling stats, regime indicator, and volume-price."""
+def compute_phase_oscillator(df: pd.DataFrame) -> pd.DataFrame:
+    """ATR/EMA-based phase oscillator with Fibonacci zones and compression.
+
+    Based on Saty Phase Oscillator concept: (Close - EMA21) / ATR creates
+    an uncapped oscillator that maps to Wyckoff-style market phases.
+
+    Zones (Fibonacci-based):
+      +100  Extreme
+      +61.8 Distribution
+      +23.6 Launch
+        0   Zero-line (momentum shift)
+      -23.6 Launch
+      -61.8 Accumulation
+      -100  Extreme
+    """
     out = df.copy()
-    c = out["Close"]
+    close = out["Close"].astype(float)
 
-    # Multi-period momentum (returns, not diffs — scale-invariant)
-    out["ret_5d"] = c.pct_change(5) * 100
-    out["ret_10d"] = c.pct_change(10) * 100
-    out["ret_20d"] = c.pct_change(20) * 100
-    out["pct_change_1d"] = c.pct_change(1) * 100
+    if len(close) < 25:
+        for col in _PHASE_COLS:
+            out[col] = 0.0
+        return out
 
-    # Rolling stats
-    out["rolling_std_5"] = c.pct_change().rolling(5).std() * 100
-    out["rolling_std_10"] = c.pct_change().rolling(10).std() * 100
-    out["rolling_std_20"] = c.pct_change().rolling(20).std() * 100
+    ema21 = close.ewm(span=21, adjust=False).mean()
 
-    # Z-score (mean reversion signal)
-    mean_20 = c.rolling(20).mean()
-    std_20 = c.rolling(20).std().replace(0, np.nan)
-    out["z_score_20"] = ((c - mean_20) / std_20).fillna(0)
+    # Get ATR
+    if "atr_14" in out.columns:
+        atr = out["atr_14"]
+    else:
+        high = out["High"].astype(float)
+        low = out["Low"].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low, (high - prev_close).abs(), (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
 
-    # Regime indicator: rolling 60-day return sign (trend vs mean-reversion context)
-    out["regime_60d"] = np.sign(c.pct_change(60)).fillna(0)
+    safe_atr = atr.replace(0, np.nan)
 
-    # Volume-price features (if volume available)
+    # Core oscillator: (Close - EMA21) / ATR, scaled to ~±100 range
+    # Multiply by 100 to put in Saty-like range
+    raw_osc = ((close - ema21) / safe_atr).fillna(0) * 100
+
+    out["phase_osc"] = raw_osc
+
+    # Discretized zone based on Fibonacci levels
+    # -2: Extreme down (<-100), -1: Accumulation (<-61.8), 0: Neutral/Launch (±23.6)
+    # +1: Distribution (>+61.8), +2: Extreme up (>+100)
+    conditions = [
+        raw_osc <= -100,
+        raw_osc <= -61.8,
+        raw_osc <= -23.6,
+        raw_osc <= 23.6,
+        raw_osc <= 61.8,
+        raw_osc <= 100,
+        raw_osc > 100,
+    ]
+    choices = [-2, -1, 0, 0, 0, 1, 2]
+    # More granular: accumulation, neutral, distribution mapping
+    zone = np.select(
+        [raw_osc <= -100, raw_osc <= -61.8, raw_osc <= 23.6,
+         raw_osc <= 61.8, raw_osc <= 100, raw_osc > 100],
+        [-2, -1, 0, 1, 1, 2],
+        default=0,
+    )
+    out["phase_zone"] = zone
+
+    # Compass: 3-bar EMA of oscillator (short-term momentum direction)
+    out["phase_momentum"] = raw_osc.ewm(span=3, adjust=False).mean().fillna(0)
+
+    # Compression: Bollinger Band width of oscillator (squeeze detection)
+    osc_std = raw_osc.rolling(20, min_periods=5).std().fillna(0)
+    osc_mean = raw_osc.rolling(20, min_periods=5).mean().fillna(0)
+    # BB width = (upper - lower) / middle; use std-based proxy
+    out["phase_compression"] = osc_std
+
+    return out
+
+
+_PHASE_COLS = ["phase_osc", "phase_zone", "phase_momentum", "phase_compression"]
+
+
+# ── 4. VOLUME STACK FEATURES ─────────────────────────────────────────────
+
+def compute_volume_stack(df: pd.DataFrame) -> pd.DataFrame:
+    """Buy/sell volume proxy from candle structure + relative volume.
+
+    Buy % = (Close - Low) / (High - Low) — price closed near high = buying
+    Sell % = (High - Close) / (High - Low) — price closed near low = selling
+    Volume bias = buy% - sell% — net directional bias
+    """
+    out = df.copy()
+    high = out["High"].astype(float)
+    low = out["Low"].astype(float)
+    close = out["Close"].astype(float)
+
+    candle_range = (high - low).replace(0, np.nan)
+
+    out["buy_volume_pct"] = ((close - low) / candle_range).fillna(0.5)
+    out["sell_volume_pct"] = ((high - close) / candle_range).fillna(0.5)
+    out["volume_bias"] = out["buy_volume_pct"] - out["sell_volume_pct"]
+
+    # Relative volume (vs 20-day mean)
     if "Volume" in out.columns:
         vol = out["Volume"].astype(float)
-        # OBV slope (5-day linear regression of cumulative OBV)
-        obv = (np.sign(c.diff()) * vol).cumsum()
-        if len(obv) >= 5:
-            obv_slope = obv.rolling(5).apply(
-                lambda x: stats.linregress(range(len(x)), x)[0] if len(x) == 5 else 0,
-                raw=False
-            )
-            out["obv_slope_5"] = obv_slope
-        else:
-            out["obv_slope_5"] = 0.0
-
-        # Relative volume (vs 20-day mean)
         avg_vol = vol.rolling(20, min_periods=5).mean()
         out["rel_volume"] = (vol / avg_vol.replace(0, np.nan)).fillna(1.0)
     else:
-        out["obv_slope_5"] = 0.0
         out["rel_volume"] = 1.0
 
     return out
 
 
-# ── 3. CROSS-ASSET FEATURES ────────────────────────────────────────────────
+_VOLUME_COLS = ["buy_volume_pct", "sell_volume_pct", "volume_bias", "rel_volume"]
+
+
+# ── 5. CROSS-ASSET FEATURES ──────────────────────────────────────────────
 
 _CROSS_ASSET_CACHE = {}
 
@@ -152,125 +284,58 @@ def _fetch_cross_asset(symbol: str, min_bars: int) -> pd.DataFrame:
         return None
 
 
-# ── 4. VOLATILITY FEATURES ─────────────────────────────────────────────────
+_CROSS_COLS = ["vix_level", "vix_change_1d", "tlt_ret_1d"]
 
-def compute_volatility_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute range-based and GARCH-family volatility estimators."""
+
+# ── 6. MOMENTUM / REGIME FEATURES ────────────────────────────────────────
+
+def compute_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Simplified momentum: 5d/20d returns + z-score."""
     out = df.copy()
-    n = len(out)
+    c = out["Close"]
 
-    if n < 20:
-        for col in _VOL_COLS:
-            out[col] = 0.0
-        return out
+    out["ret_5d"] = c.pct_change(5, fill_method=None) * 100
+    out["ret_20d"] = c.pct_change(20, fill_method=None) * 100
 
-    h = np.log(out["High"] / out["Open"]).values
-    l = np.log(out["Low"] / out["Open"]).values
-    c_o = np.log(out["Close"] / out["Open"]).values
-    o_c_prev = np.log(out["Open"] / out["Close"].shift(1)).fillna(0).values
-    window = 20
-
-    # Parkinson
-    hl = np.log(out["High"] / out["Low"]).values
-    park_var = pd.Series(hl ** 2 / (4 * np.log(2)), index=out.index)
-    out["vol_parkinson"] = np.sqrt(park_var.rolling(window, min_periods=5).mean()) * np.sqrt(252) * 100
-
-    # Garman-Klass
-    gk_var = 0.5 * hl ** 2 - (2 * np.log(2) - 1) * c_o ** 2
-    gk_series = pd.Series(gk_var, index=out.index)
-    out["vol_garman_klass"] = np.sqrt(gk_series.rolling(window, min_periods=5).mean().clip(lower=0)) * np.sqrt(252) * 100
-
-    # Rogers-Satchell
-    rs_var = h * (h - c_o) + l * (l - c_o)
-    rs_series = pd.Series(rs_var, index=out.index)
-    out["vol_rogers_satchell"] = np.sqrt(rs_series.rolling(window, min_periods=5).mean().clip(lower=0)) * np.sqrt(252) * 100
-
-    # Yang-Zhang
-    o_var = pd.Series(o_c_prev ** 2, index=out.index).rolling(window, min_periods=5).mean()
-    c_var = pd.Series(c_o ** 2, index=out.index).rolling(window, min_periods=5).mean()
-    rs_var_roll = rs_series.rolling(window, min_periods=5).mean()
-    k = 0.34 / (1.34 + (window + 1) / (window - 1))
-    yz_var = o_var + k * c_var + (1 - k) * rs_var_roll
-    out["vol_yang_zhang"] = np.sqrt(yz_var.clip(lower=0)) * np.sqrt(252) * 100
-
-    # Fast GARCH proxies via ewm
-    log_ret = np.log(out["Close"] / out["Close"].shift(1)).fillna(0)
-    ewm_var = (log_ret ** 2).ewm(span=20, min_periods=5).mean()
-    neg_ret = log_ret.clip(upper=0)
-    ewm_var_neg = (neg_ret ** 2).ewm(span=20, min_periods=5).mean()
-    leverage = (log_ret < 0).astype(float) * (log_ret ** 2)
-    ewm_leverage = leverage.ewm(span=20, min_periods=5).mean()
-
-    out["vol_garch11"] = np.sqrt(ewm_var) * np.sqrt(252) * 100
-    out["vol_egarch"] = np.sqrt(0.6 * ewm_var + 0.4 * ewm_var_neg) * np.sqrt(252) * 100
-    out["vol_gjr_garch"] = np.sqrt(0.7 * ewm_var + 0.3 * ewm_leverage) * np.sqrt(252) * 100
-
-    # HAR-RV
-    rv_daily = log_ret ** 2
-    rv_5d = rv_daily.rolling(5).mean()
-    rv_22d = rv_daily.rolling(22).mean()
-    out["vol_har_rv"] = np.sqrt(
-        0.2 * rv_daily + 0.4 * rv_5d.fillna(0) + 0.4 * rv_22d.fillna(0)
-    ) * np.sqrt(252) * 100
-
-    # Vol-of-vol (rolling std of realized vol — measures vol regime stability)
-    out["vol_of_vol"] = out["vol_har_rv"].rolling(10, min_periods=3).std().fillna(0)
-
-    # Grouped ensembles
-    out["vol_lpv_ensemble"] = (
-        out["vol_parkinson"].fillna(0) +
-        out["vol_garman_klass"].fillna(0) +
-        out["vol_rogers_satchell"].fillna(0)
-    ) / 3
-
-    out["vol_super_hybrid"] = (
-        0.35 * out["vol_yang_zhang"].fillna(0) +
-        0.25 * out["vol_gjr_garch"].fillna(0) +
-        0.25 * out["vol_har_rv"].fillna(0) +
-        0.15 * out["vol_lpv_ensemble"].fillna(0)
-    )
+    # Z-score (mean reversion signal)
+    mean_20 = c.rolling(20).mean()
+    std_20 = c.rolling(20).std().replace(0, np.nan)
+    out["z_score_20"] = ((c - mean_20) / std_20).fillna(0)
 
     return out
 
 
-_VOL_COLS = [
-    "vol_parkinson", "vol_garman_klass", "vol_rogers_satchell",
-    "vol_yang_zhang", "vol_garch11", "vol_egarch", "vol_gjr_garch",
-    "vol_har_rv", "vol_of_vol", "vol_lpv_ensemble", "vol_super_hybrid",
-]
+_MOMENTUM_COLS = ["ret_5d", "ret_20d", "z_score_20"]
 
 
-# ── 5. MASTER FEATURE BUILDER ──────────────────────────────────────────────
+# ── 7. MASTER FEATURE BUILDER ────────────────────────────────────────────
 
-# Final feature list — pruned to high-signal features only
-# Removed: linear_fit, quad_fit, initial_velocity, rolling_mean_5/10 (price-level = leakage risk)
-# Added: regime_60d, vix_level, vix_change_1d, tlt_ret_1d, obv_slope_5, rel_volume, vol_of_vol
+# Final feature list — Saty-framework aligned
 FEATURE_COLS = [
-    # Kinematics (scale-invariant)
-    "linear_velocity", "r_squared", "trend_direction",
-    "acceleration", "linear_residual", "quad_residual",
-    # Momentum (return-based, not price-level)
-    "ret_5d", "ret_10d", "ret_20d", "pct_change_1d",
-    # Rolling vol stats
-    "rolling_std_5", "rolling_std_10", "rolling_std_20",
-    # Derived
-    "z_score_20", "regime_60d",
-    # Cross-asset
+    # ATR Levels
+    "atr_14", "atr_pct", "price_vs_pivot", "atr_target_dist",
+    # EMA Ribbon (8, 13, 21, 48, 200)
+    "ema_ribbon_spread", "ema_8_13_cross", "ema_13_48_cross",
+    "ema_slope_21", "price_vs_ema21",
+    # Phase Oscillator (Wyckoff zones)
+    "phase_osc", "phase_zone", "phase_momentum", "phase_compression",
+    # Volume Stack
+    "buy_volume_pct", "sell_volume_pct", "volume_bias", "rel_volume",
+    # Cross-asset context
     "vix_level", "vix_change_1d", "tlt_ret_1d",
-    # Volume-price
-    "obv_slope_5", "rel_volume",
-    # Volatility (grouped)
-    "vol_yang_zhang", "vol_gjr_garch", "vol_har_rv",
-    "vol_lpv_ensemble", "vol_super_hybrid", "vol_of_vol",
+    # Momentum / regime
+    "ret_5d", "ret_20d", "z_score_20",
 ]
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Full feature pipeline: kinematics + momentum + cross-asset + volatility."""
-    out = compute_kinematic_features(df)
-    out = compute_momentum_features(out)
+    """Full Saty-framework feature pipeline."""
+    out = compute_atr_features(df)
+    out = compute_ema_ribbon(out)
+    out = compute_phase_oscillator(out)
+    out = compute_volume_stack(out)
     out = compute_cross_asset_features(out)
-    out = compute_volatility_features(out)
+    out = compute_momentum_features(out)
     return out
 
 
@@ -289,7 +354,7 @@ def get_feature_matrix(df: pd.DataFrame) -> tuple:
 
 
 def build_forecast(df: pd.DataFrame, n_days: int = 10) -> pd.DataFrame:
-    """Generate kinematic extrapolation forecasts."""
+    """Generate kinematic extrapolation forecasts (linear + quadratic)."""
     close = df["Close"].values.astype(float)
     t = np.arange(len(close))
 
@@ -308,16 +373,16 @@ def build_forecast(df: pd.DataFrame, n_days: int = 10) -> pd.DataFrame:
     })
 
 
-# ── 6. TREND VALIDATION ────────────────────────────────────────────────────
+# ── 8. TREND VALIDATION ──────────────────────────────────────────────────
 
 def validate_trends(df: pd.DataFrame) -> dict:
-    """Run ADF stationarity tests on key trend features.
+    """Run ADF stationarity tests on key features.
 
     Returns dict of {feature: {adf_stat, p_value, is_spurious}}.
     If p_value > 0.05, the feature is non-stationary (potential spurious trend).
     """
     results = {}
-    trend_cols = ["ret_20d", "regime_60d", "z_score_20"]
+    trend_cols = ["ret_20d", "z_score_20", "phase_osc"]
 
     for col in trend_cols:
         if col not in df.columns:

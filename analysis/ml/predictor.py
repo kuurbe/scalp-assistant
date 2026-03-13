@@ -64,7 +64,7 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
     featured = build_features(df)
 
     # Targets
-    featured["target_ret"] = featured["Close"].pct_change().shift(-1) * 100
+    featured["target_ret"] = featured["Close"].pct_change(fill_method=None).shift(-1) * 100
     featured["target_dir"] = (featured["target_ret"] > 0.05).astype(int)
 
     clean = featured.dropna(subset=FEATURE_COLS + ["target_ret"])
@@ -100,8 +100,8 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
         y_dir_train, y_dir_test = y_dir[train_idx], y_dir[test_idx]
 
         reg = GradientBoostingRegressor(
-            n_estimators=200, learning_rate=0.05, max_depth=3,
-            subsample=0.8, min_samples_leaf=10, random_state=42,
+            n_estimators=120, learning_rate=0.03, max_depth=2,
+            subsample=0.7, min_samples_leaf=25, random_state=42,
         )
         reg.fit(X_train, y_ret_train)
 
@@ -109,8 +109,8 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
         r2_test = reg.score(X_test, y_ret_test)
 
         clf = GradientBoostingClassifier(
-            n_estimators=200, learning_rate=0.05, max_depth=3,
-            subsample=0.8, min_samples_leaf=10, random_state=42,
+            n_estimators=120, learning_rate=0.03, max_depth=2,
+            subsample=0.7, min_samples_leaf=25, random_state=42,
         )
         clf.fit(X_train, y_dir_train)
 

@@ -17,6 +17,7 @@ import datetime
 import logging
 import os
 import sys
+from zoneinfo import ZoneInfo
 
 # Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,7 +45,8 @@ log = logging.getLogger("scanner")
 # ─────────────────────────────────────────────────────────────
 
 def _header() -> str:
-    now = datetime.datetime.now().strftime("%b %d, %I:%M %p")
+    et = ZoneInfo("America/New_York")
+    now = datetime.datetime.now(et).strftime("%b %d, %I:%M %p ET")
     return f"📡 <b>Scalp Assistant</b> — {now}\n{'━' * 30}"
 
 
@@ -344,8 +346,9 @@ def _dispatch_alerts(results: dict) -> None:
 
     if total == 0:
         log.info("No actionable setups found — no alerts to send.")
-        # Send a quiet "nothing found" update only at market open
-        now = datetime.datetime.now()
+        # Send a quiet "nothing found" update only at market open (ET)
+        et = ZoneInfo("America/New_York")
+        now = datetime.datetime.now(et)
         if now.hour == 9 and now.minute < 45:
             send_telegram(f"{_header()}\n\n😴 No actionable setups this scan.\nMarkets may be quiet — will scan again shortly.")
         return
@@ -414,7 +417,8 @@ def _dispatch_alerts(results: dict) -> None:
 
 def send_test_alert() -> None:
     """Send a realistic test alert to verify Telegram is working."""
-    now = datetime.datetime.now().strftime("%b %d, %I:%M %p")
+    et = ZoneInfo("America/New_York")
+    now = datetime.datetime.now(et).strftime("%b %d, %I:%M %p ET")
 
     msg = (
         f"📡 <b>Scalp Assistant</b> — {now}\n"
