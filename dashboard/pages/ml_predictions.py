@@ -1,6 +1,6 @@
 """
-ML Predictions page — Live ML forecasts, confidence intervals, backtesting,
-candlestick charts with forecast overlays, and feature importance.
+ML Predictions page — Walk-forward validated ML forecasts, confidence intervals,
+backtesting with per-fold metrics, and feature importance.
 """
 
 import streamlit as st
@@ -12,7 +12,6 @@ from dashboard.theme import COLORS, CARD_CSS, FONT
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _fetch_ohlcv(ticker: str, period: str = "120d"):
-    """Fetch OHLCV data via yfinance."""
     import yfinance as yf
     df = yf.download(ticker, period=period, progress=False)
     if df is not None and isinstance(df.columns, pd.MultiIndex):
@@ -22,7 +21,6 @@ def _fetch_ohlcv(ticker: str, period: str = "120d"):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _run_prediction(ticker: str):
-    """Run ML prediction pipeline for a ticker."""
     from analysis.ml.predictor import predict_ticker
     df = _fetch_ohlcv(ticker)
     if df is None or len(df) < 30:
@@ -32,66 +30,102 @@ def _run_prediction(ticker: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _run_backtest(ticker: str):
-    """Run backtest: train/test split, return metrics + series."""
+    """Walk-forward backtest using TimeSeriesSplit."""
     from analysis.ml.feature_engine import build_features, FEATURE_COLS
-    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
     from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import TimeSeriesSplit
 
-    df = _fetch_ohlcv(ticker, period="365d")
-    if df is None or len(df) < 60:
+    df = _fetch_ohlcv(ticker, period="730d")
+    if df is None or len(df) < 80:
         return None
 
     featured = build_features(df)
     featured["target"] = featured["Close"].pct_change().shift(-1) * 100
+    featured["target_dir"] = (featured["target"] > 0.05).astype(int)
     clean = featured.dropna(subset=FEATURE_COLS + ["target"])
 
-    if len(clean) < 40:
+    if len(clean) < 80:
         return None
 
     X = clean[FEATURE_COLS].values
     y_ret = clean["target"].values
-    y_dir = (y_ret > 0.05).astype(int)  # Directional target
+    y_dir = clean["target_dir"].values
     dates = clean.index
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    dummy_hit = max(np.mean(y_dir), 1 - np.mean(y_dir)) * 100
 
-    split = int(len(X_scaled) * 0.8)
-    X_train, X_test = X_scaled[:split], X_scaled[split:]
-    y_ret_train, y_ret_test = y_ret[:split], y_ret[split:]
-    y_dir_train, y_dir_test = y_dir[:split], y_dir[split:]
-    dates_test = dates[split:]
+    tscv = TimeSeriesSplit(n_splits=5, gap=1)
+    fold_results = []
+    all_preds_ret, all_actual_ret = [], []
+    all_preds_dir, all_actual_dir = [], []
+    all_dates = []
 
-    # Regressor for magnitude
-    reg_model = GradientBoostingRegressor(
+    for fold_i, (train_idx, test_idx) in enumerate(tscv.split(X)):
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X[train_idx])
+        X_test = scaler.transform(X[test_idx])
+
+        reg = GradientBoostingRegressor(
+            n_estimators=200, learning_rate=0.05, max_depth=3,
+            subsample=0.8, min_samples_leaf=10, random_state=42,
+        )
+        reg.fit(X_train, y_ret[train_idx])
+
+        clf = GradientBoostingClassifier(
+            n_estimators=200, learning_rate=0.05, max_depth=3,
+            subsample=0.8, min_samples_leaf=10, random_state=42,
+        )
+        clf.fit(X_train, y_dir[train_idx])
+
+        preds_ret = reg.predict(X_test)
+        preds_dir = clf.predict(X_test)
+        hit = float(np.mean(preds_dir == y_dir[test_idx])) * 100
+        r2 = reg.score(X_test, y_ret[test_idx])
+
+        fold_results.append({
+            "fold": fold_i + 1,
+            "date_range": f"{dates[test_idx[0]].strftime('%Y-%m-%d')} → {dates[test_idx[-1]].strftime('%Y-%m-%d')}",
+            "hit_rate": round(hit, 1),
+            "r2": round(r2, 4),
+            "n_test": len(test_idx),
+        })
+
+        all_preds_ret.extend(preds_ret)
+        all_actual_ret.extend(y_ret[test_idx])
+        all_preds_dir.extend(preds_dir)
+        all_actual_dir.extend(y_dir[test_idx])
+        all_dates.extend(dates[test_idx])
+
+    all_preds_ret = np.array(all_preds_ret)
+    all_actual_ret = np.array(all_actual_ret)
+    all_preds_dir = np.array(all_preds_dir)
+    all_actual_dir = np.array(all_actual_dir)
+
+    wf_hit = float(np.mean(all_preds_dir == all_actual_dir)) * 100
+    ss_res = np.sum((all_actual_ret - all_preds_ret) ** 2)
+    ss_tot = np.sum((all_actual_ret - np.mean(all_actual_ret)) ** 2)
+    wf_r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    # Feature importances from full-data model
+    scaler_full = StandardScaler()
+    X_full = scaler_full.fit_transform(X)
+    clf_full = GradientBoostingClassifier(
         n_estimators=200, learning_rate=0.05, max_depth=3,
         subsample=0.8, min_samples_leaf=10, random_state=42,
     )
-    reg_model.fit(X_train, y_ret_train)
-    y_pred = reg_model.predict(X_test)
-    r2 = reg_model.score(X_test, y_ret_test)
-
-    # Classifier for direction
-    from sklearn.ensemble import GradientBoostingClassifier
-    clf_model = GradientBoostingClassifier(
-        n_estimators=200, learning_rate=0.05, max_depth=3,
-        subsample=0.8, min_samples_leaf=10, random_state=42,
-    )
-    clf_model.fit(X_train, y_dir_train)
-    y_dir_pred = clf_model.predict(X_test)
-    hit_rate = float(np.mean(y_dir_pred == y_dir_test)) * 100
-    directional_accuracy = float(np.mean(np.sign(y_pred) == np.sign(y_ret_test))) * 100
-
-    importances = dict(zip(FEATURE_COLS, clf_model.feature_importances_))
+    clf_full.fit(X_full, y_dir)
+    importances = dict(zip(FEATURE_COLS, clf_full.feature_importances_))
 
     return {
-        "directional_accuracy": round(directional_accuracy, 1),
-        "hit_rate": round(hit_rate, 1),
-        "r2": round(r2, 4),
-        "n_test": len(y_ret_test),
-        "y_test": y_ret_test,
-        "y_pred": y_pred,
-        "dates_test": dates_test,
+        "wf_hit_rate": round(wf_hit, 1),
+        "wf_r2": round(wf_r2, 4),
+        "dummy_baseline": round(dummy_hit, 1),
+        "edge": round(wf_hit - dummy_hit, 1),
+        "fold_results": fold_results,
+        "y_test": all_actual_ret,
+        "y_pred": all_preds_ret,
+        "dates_test": all_dates,
         "feature_importances": {k: round(v, 4) for k, v in
                                  sorted(importances.items(), key=lambda x: -x[1])},
     }
@@ -99,7 +133,6 @@ def _run_backtest(ticker: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _bootstrap_confidence(ticker: str, n_bootstraps: int = 30):
-    """Bootstrap ensemble for confidence intervals."""
     from analysis.ml.feature_engine import build_features, FEATURE_COLS
     from sklearn.ensemble import GradientBoostingRegressor
     from sklearn.preprocessing import StandardScaler
@@ -123,17 +156,15 @@ def _bootstrap_confidence(ticker: str, n_bootstraps: int = 30):
     X_scaled = scaler.fit_transform(X)
 
     split = int(len(X_scaled) * 0.8)
-    X_train, X_test = X_scaled[:split], X_scaled[split:]
-    y_train, y_test = y[:split], y[split:]
-
-    # Latest point for prediction
+    X_train = X_scaled[:split]
+    y_train = y[:split]
     X_latest = X_scaled[-1:]
 
     preds = []
     for _ in range(n_bootstraps):
         X_b, y_b = resample(X_train, y_train)
         m = GradientBoostingRegressor(
-            n_estimators=100, learning_rate=0.05, max_depth=4,
+            n_estimators=100, learning_rate=0.05, max_depth=3,
             subsample=0.8, random_state=None,
         )
         m.fit(X_b, y_b)
@@ -157,7 +188,7 @@ def render():
         ML Predictions
     </div>
     <div style="font-size:15px; color:{COLORS['text_muted']}; margin-bottom:28px;">
-        Machine learning forecasts with confidence intervals, backtesting &amp; feature analysis
+        Walk-forward validated forecasts with confidence intervals &amp; feature analysis
     </div>
     """, unsafe_allow_html=True)
 
@@ -194,7 +225,7 @@ def render():
     current_price = float(df["Close"].iloc[-1])
 
     dir_color = COLORS["success"] if direction == "BULL" else (COLORS["danger"] if direction == "BEAR" else COLORS["warning"])
-    dir_icon = "↑" if direction == "BULL" else ("↓" if direction == "BEAR" else "→")
+    dir_icon = "^" if direction == "BULL" else ("v" if direction == "BEAR" else "-")
 
     c1, c2, c3, c4, c5 = st.columns(5)
 
@@ -233,10 +264,19 @@ def render():
         st.markdown(f"""<div style="{CARD_CSS} text-align:center; padding:20px;">
             <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase; letter-spacing:0.06em;">ML SCORE</div>
             <div style="font-size:26px; font-weight:700; color:{score_color}; margin-top:8px;">{ml_score:.0f}</div>
-            <div style="font-size:12px; color:{COLORS['text_dim']}; margin-top:4px;">0-100 scale</div>
+            <div style="font-size:12px; color:{COLORS['text_dim']}; margin-top:4px;">Sharpe-adjusted</div>
         </div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
+
+    # ─── Drift warning ───
+    drift = prediction.get("drift_warning", "")
+    if drift:
+        st.markdown(f"""<div style="{CARD_CSS} border-left:4px solid {COLORS['warning']}; padding:12px 16px;">
+            <div style="font-size:13px; color:{COLORS['warning']}; font-weight:600;">Distribution Drift Detected</div>
+            <div style="font-size:12px; color:{COLORS['text_secondary']}; margin-top:4px;">{drift}</div>
+        </div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
 
     # ─── Signal callout ───
     if abs(pred_ret) > 0.2 and confidence >= 50:
@@ -245,9 +285,6 @@ def render():
         target_price = current_price * (1 + pred_ret / 100)
         st.markdown(f"""<div style="{CARD_CSS} border-left:4px solid {signal_color}; padding:16px 20px;">
             <div style="display:flex; align-items:center; gap:12px;">
-                <div style="width:40px; height:40px; border-radius:50%; background:{signal_color}15; display:flex; align-items:center; justify-content:center;">
-                    <span style="font-size:20px; color:{signal_color};">{"📈" if signal_type == "BUY" else "📉"}</span>
-                </div>
                 <div>
                     <div style="font-size:16px; font-weight:600; color:{signal_color};">{signal_type} Signal — {ticker}</div>
                     <div style="font-size:13px; color:{COLORS['text_secondary']};">
@@ -283,8 +320,54 @@ def render():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ─── Confidence Intervals + Backtest (side by side) ───
-    col_ci, col_bt = st.columns(2)
+    # ─── Walk-Forward Backtest + Confidence Intervals ───
+    col_bt, col_ci = st.columns(2)
+
+    with col_bt:
+        st.markdown(f"""<div style="font-size:18px; font-weight:600; color:{COLORS['text']}; margin-bottom:12px;">Walk-Forward Backtest</div>""", unsafe_allow_html=True)
+        with st.spinner("Running walk-forward validation..."):
+            bt = _run_backtest(ticker)
+        if bt:
+            wf_hit = bt["wf_hit_rate"]
+            wf_r2 = bt["wf_r2"]
+            dummy = bt["dummy_baseline"]
+            edge = bt["edge"]
+            edge_color = COLORS["success"] if edge > 0 else COLORS["danger"]
+            hit_color = COLORS["success"] if wf_hit > dummy else COLORS["danger"]
+
+            st.markdown(f"""<div style="{CARD_CSS} padding:20px;">
+                <div style="display:flex; gap:16px; margin-bottom:16px;">
+                    <div style="flex:1; text-align:center;">
+                        <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase;">HIT RATE</div>
+                        <div style="font-size:22px; font-weight:700; color:{hit_color};">{wf_hit:.1f}%</div>
+                    </div>
+                    <div style="flex:1; text-align:center;">
+                        <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase;">VS DUMMY</div>
+                        <div style="font-size:22px; font-weight:700; color:{edge_color};">{edge:+.1f}pp</div>
+                    </div>
+                    <div style="flex:1; text-align:center;">
+                        <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase;">R²</div>
+                        <div style="font-size:22px; font-weight:700; color:{COLORS['text']};">{wf_r2:.4f}</div>
+                    </div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            # Per-fold results
+            folds = bt.get("fold_results", [])
+            if folds:
+                st.markdown(f"""<div style="font-size:14px; font-weight:600; color:{COLORS['text']}; margin:12px 0 8px 0;">Per-Fold Results</div>""", unsafe_allow_html=True)
+                for f in folds:
+                    hit_c = COLORS["success"] if f["hit_rate"] > 52 else (COLORS["danger"] if f["hit_rate"] < 48 else COLORS["warning"])
+                    st.markdown(f"""<div style="display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px solid {COLORS['border_light']}; font-size:12px;">
+                        <span style="color:{COLORS['text_dim']};">Fold {f['fold']}</span>
+                        <span style="color:{COLORS['text_secondary']};">{f['date_range']}</span>
+                        <span style="color:{hit_c}; font-weight:600;">{f['hit_rate']}%</span>
+                    </div>""", unsafe_allow_html=True)
+
+            # Actual vs predicted chart
+            _render_backtest_chart(bt)
+        else:
+            st.markdown(f"""<div style="{CARD_CSS} text-align:center; color:{COLORS['text_dim']}; padding:40px;">Not enough data for backtest</div>""", unsafe_allow_html=True)
 
     with col_ci:
         st.markdown(f"""<div style="font-size:18px; font-weight:600; color:{COLORS['text']}; margin-bottom:12px;">Confidence Intervals</div>""", unsafe_allow_html=True)
@@ -296,7 +379,6 @@ def render():
             ci_mean = ci["mean"]
             ci_std = ci["std"]
 
-            # Visual bar
             bar_min = min(ci_low, -2)
             bar_max = max(ci_high, 2)
             bar_range = bar_max - bar_min
@@ -312,7 +394,7 @@ def render():
                 </div>
                 <div style="display:flex; justify-content:space-between;">
                     <div style="text-align:center;">
-                        <div style="font-size:11px; color:{COLORS['text_muted']};">LOW (5th %ile)</div>
+                        <div style="font-size:11px; color:{COLORS['text_muted']};">LOW (5th)</div>
                         <div style="font-size:16px; font-weight:600; color:{COLORS['danger']};">{ci_low:+.2f}%</div>
                     </div>
                     <div style="text-align:center;">
@@ -320,52 +402,14 @@ def render():
                         <div style="font-size:16px; font-weight:600; color:{COLORS['text']};">{ci_mean:+.2f}%</div>
                     </div>
                     <div style="text-align:center;">
-                        <div style="font-size:11px; color:{COLORS['text_muted']};">HIGH (95th %ile)</div>
+                        <div style="font-size:11px; color:{COLORS['text_muted']};">HIGH (95th)</div>
                         <div style="font-size:16px; font-weight:600; color:{COLORS['success']};">{ci_high:+.2f}%</div>
                     </div>
                 </div>
                 <div style="text-align:center; margin-top:12px; font-size:12px; color:{COLORS['text_dim']};">Spread: {ci_std:.3f}% — {"tight (high confidence)" if ci_std < 0.5 else "wide (lower confidence)"}</div>
             </div>""", unsafe_allow_html=True)
         else:
-            st.markdown(f"""<div style="{CARD_CSS} text-align:center; color:{COLORS['text_dim']}; padding:40px;">Not enough data for bootstrap analysis</div>""", unsafe_allow_html=True)
-
-    with col_bt:
-        st.markdown(f"""<div style="font-size:18px; font-weight:600; color:{COLORS['text']}; margin-bottom:12px;">Backtest Results</div>""", unsafe_allow_html=True)
-        with st.spinner("Running backtest..."):
-            bt = _run_backtest(ticker)
-        if bt:
-            hit_rate = bt.get("hit_rate", bt["directional_accuracy"])
-            da = bt["directional_accuracy"]
-            r2 = bt["r2"]
-            n = bt["n_test"]
-            hr_color = COLORS["success"] if hit_rate >= 55 else (COLORS["warning"] if hit_rate >= 45 else COLORS["danger"])
-            da_color = COLORS["success"] if da >= 55 else (COLORS["warning"] if da >= 45 else COLORS["danger"])
-
-            st.markdown(f"""<div style="{CARD_CSS} padding:20px;">
-                <div style="display:flex; gap:16px; margin-bottom:16px;">
-                    <div style="flex:1; text-align:center;">
-                        <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase;">CLASSIFIER HIT RATE</div>
-                        <div style="font-size:22px; font-weight:700; color:{hr_color};">{hit_rate:.1f}%</div>
-                    </div>
-                    <div style="flex:1; text-align:center;">
-                        <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase;">REGRESSOR DIR.</div>
-                        <div style="font-size:22px; font-weight:700; color:{da_color};">{da:.1f}%</div>
-                    </div>
-                    <div style="flex:1; text-align:center;">
-                        <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase;">R²</div>
-                        <div style="font-size:22px; font-weight:700; color:{COLORS['text']};">{r2:.4f}</div>
-                    </div>
-                    <div style="flex:1; text-align:center;">
-                        <div style="font-size:11px; color:{COLORS['text_muted']}; text-transform:uppercase;">TEST DAYS</div>
-                        <div style="font-size:22px; font-weight:700; color:{COLORS['text']};">{n}</div>
-                    </div>
-                </div>
-            </div>""", unsafe_allow_html=True)
-
-            # Actual vs predicted chart
-            _render_backtest_chart(bt)
-        else:
-            st.markdown(f"""<div style="{CARD_CSS} text-align:center; color:{COLORS['text_dim']}; padding:40px;">Not enough data for backtest</div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div style="{CARD_CSS} text-align:center; color:{COLORS['text_dim']}; padding:40px;">Not enough data for bootstrap</div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -377,7 +421,7 @@ def render():
         top_features = list(importances.items())[:10]
 
         for fname, fimp in top_features:
-            bar_width = min(fimp * 500, 100)  # Scale for display
+            bar_width = min(fimp * 500, 100)
             bar_color = COLORS["accent"] if fimp > 0.08 else COLORS["text_secondary"]
             st.markdown(f"""<div style="display:flex; align-items:center; gap:12px; padding:6px 0;">
                 <div style="width:160px; font-size:13px; color:{COLORS['text_secondary']}; text-align:right;">{fname}</div>
@@ -392,65 +436,49 @@ def render():
     _, col_train, _ = st.columns([1, 2, 1])
     with col_train:
         if st.button("Re-train Model", type="secondary", use_container_width=True):
-            with st.spinner(f"Training model on {ticker}..."):
+            with st.spinner(f"Training model on {ticker} (walk-forward, 730d)..."):
                 from analysis.ml.predictor import train_model
                 result = train_model(ticker, lookback_days=730)
             if "error" in result:
                 st.error(result["error"])
             else:
-                st.success(f"Model trained! R² test: {result['r2_test']:.4f} | Samples: {result['n_samples']}")
+                warnings = result.get("warnings", [])
+                warn_text = f" | Warnings: {len(warnings)}" if warnings else ""
+                st.success(f"Walk-forward hit rate: {result['hit_rate_test']:.1f}% | Edge: {result['hit_rate_test'] - result.get('dummy_baseline', 50):+.1f}pp{warn_text}")
+                if warnings:
+                    for w in warnings:
+                        st.warning(w)
                 st.rerun()
 
 
 # ── Chart helpers ───────────────────────────────────────────────────────────
 
 def _render_candlestick(df, prediction, ticker):
-    """Render candlestick chart with forecast overlay using Plotly."""
     try:
         import plotly.graph_objects as go
 
-        # Last 60 days for readability
         recent = df.tail(60)
 
         fig = go.Figure()
-
-        # Candlesticks
         fig.add_trace(go.Candlestick(
             x=recent.index,
-            open=recent["Open"],
-            high=recent["High"],
-            low=recent["Low"],
-            close=recent["Close"],
+            open=recent["Open"], high=recent["High"],
+            low=recent["Low"], close=recent["Close"],
             name=ticker,
             increasing_line_color=COLORS["success"],
             decreasing_line_color=COLORS["danger"],
         ))
 
-        # Forecast overlay
         forecast = prediction.get("forecast_10d", [])
         if forecast:
             last_date = recent.index[-1]
             forecast_dates = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=len(forecast))
-            linear_prices = [f["linear_pred"] for f in forecast]
-            kinematic_prices = [f["kinematic_pred"] for f in forecast]
             avg_prices = [f["avg_pred"] for f in forecast]
 
             fig.add_trace(go.Scatter(
                 x=forecast_dates, y=avg_prices,
                 mode="lines", name="ML Forecast",
                 line=dict(color=COLORS["accent"], width=2, dash="dash"),
-            ))
-            fig.add_trace(go.Scatter(
-                x=forecast_dates, y=linear_prices,
-                mode="lines", name="Linear",
-                line=dict(color=COLORS["text_dim"], width=1, dash="dot"),
-                visible="legendonly",
-            ))
-            fig.add_trace(go.Scatter(
-                x=forecast_dates, y=kinematic_prices,
-                mode="lines", name="Kinematic",
-                line=dict(color=COLORS["warning"], width=1, dash="dot"),
-                visible="legendonly",
             ))
 
         fig.update_layout(
@@ -471,7 +499,6 @@ def _render_candlestick(df, prediction, ticker):
 
 
 def _render_backtest_chart(bt):
-    """Render actual vs predicted returns chart."""
     try:
         import plotly.graph_objects as go
 
