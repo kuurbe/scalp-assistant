@@ -226,15 +226,18 @@ def fetch_index_data() -> list[dict]:
                 if t is None:
                     # Try direct
                     t = yf.Ticker(sym)
+                import math
                 hist = t.history(period="2d")
                 if len(hist) >= 2:
                     close = float(hist["Close"].iloc[-1])
                     prev = float(hist["Close"].iloc[-2])
-                    pct = ((close - prev) / prev) * 100
-                    results.append({"name": name, "price": close, "change_pct": round(pct, 2)})
+                    if not math.isnan(close) and not math.isnan(prev) and prev > 0:
+                        pct = ((close - prev) / prev) * 100
+                        results.append({"name": name, "price": close, "change_pct": round(pct, 2)})
                 elif len(hist) == 1:
                     close = float(hist["Close"].iloc[-1])
-                    results.append({"name": name, "price": close, "change_pct": 0})
+                    if not math.isnan(close):
+                        results.append({"name": name, "price": close, "change_pct": 0})
             except Exception:
                 pass
         return results
@@ -254,11 +257,15 @@ def fetch_sector_performance() -> list[dict]:
         for name, etf in zip(sector_names, etf_symbols):
             try:
                 t = yf.Ticker(etf)
+                import math
                 hist = t.history(period="2d")
                 if len(hist) >= 2:
                     close = float(hist["Close"].iloc[-1])
                     prev = float(hist["Close"].iloc[-2])
-                    pct = ((close - prev) / prev) * 100
+                    if not math.isnan(close) and not math.isnan(prev) and prev > 0:
+                        pct = ((close - prev) / prev) * 100
+                    else:
+                        pct = 0
                 else:
                     pct = 0
                 results.append({

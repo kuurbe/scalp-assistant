@@ -97,14 +97,15 @@ def get_macro_context() -> dict:
         from data.fetchers.fred_fetcher import get_macro_context as _get_macro
         ctx = _get_macro()
         # Fallback VIX
-        if not ctx.get("vix"):
+        if not ctx.get("vix") or (isinstance(ctx.get("vix"), float) and __import__("math").isnan(ctx["vix"])):
             try:
                 import yfinance as yf
                 h = yf.Ticker("^VIX").history(period="2d")
                 if len(h) > 0:
-                    ctx["vix"] = round(float(h["Close"].iloc[-1]), 2)
+                    val = float(h["Close"].iloc[-1])
+                    ctx["vix"] = round(val, 2) if not __import__("math").isnan(val) else 0
             except Exception:
-                pass
+                ctx["vix"] = 0
         return ctx
     except Exception:
         return {"vix": 0, "macro_regime": "NEUTRAL"}

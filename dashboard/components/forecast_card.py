@@ -2,8 +2,21 @@
 Stock forecast card — mini price chart with prediction overlay.
 Shows recent price action + forecast direction + key levels.
 """
+import math
 import streamlit as st
 from dashboard.theme import COLORS
+
+
+def _safe(val, default=0):
+    """Return default if val is NaN, None, or inf."""
+    if val is None:
+        return default
+    try:
+        if math.isnan(val) or math.isinf(val):
+            return default
+    except (TypeError, ValueError):
+        return default
+    return val
 
 
 def _build_chart_svg(prices: list, forecast: list = None, width: int = 280, height: int = 100) -> str:
@@ -92,6 +105,10 @@ def forecast_card(ticker: str, price: float, pct_change: float, signal: str,
         resistance: Resistance level
         target: Price target
     """
+    price = _safe(price)
+    pct_change = _safe(pct_change)
+    confidence = int(_safe(confidence, 50))
+
     # Signal badge colors
     if signal == "BUY":
         sig_color = COLORS["success"]

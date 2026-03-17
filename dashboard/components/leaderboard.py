@@ -3,9 +3,22 @@ Leaderboard table component — clean sortable table of scored tickers.
 Supports Simple and Advanced view modes + BUY/HOLD/SELL signal column.
 Matches reference card-based design with clean typography.
 """
+import math
 import streamlit as st
 import pandas as pd
 from dashboard.theme import COLORS
+
+
+def _safe(val, default=0):
+    """Return default if val is NaN, None, or inf."""
+    if val is None:
+        return default
+    try:
+        if math.isnan(val) or math.isinf(val):
+            return default
+    except (TypeError, ValueError):
+        return default
+    return val
 
 
 def render_leaderboard(scored_tickers: list, max_rows: int = 20, simple: bool = False):
@@ -37,11 +50,13 @@ def _render_simple(scored_tickers: list, max_rows: int, has_recs: bool):
 
     signal_html = ""
     for i, pick in enumerate(scored_tickers[:max_rows], 1):
-        arrow = "+" if pick.pct_change >= 0 else ""
+        price = _safe(pick.price)
+        pct = _safe(pick.pct_change)
+        arrow = "+" if pct >= 0 else ""
         rec = get_recommendation(pick) if has_recs else {"signal": "—", "action": "Monitor"}
         sig = rec["signal"]
         action = rec.get("action", "Monitor")[:40]
-        change_color = COLORS["success"] if pick.pct_change >= 0 else COLORS["danger"]
+        change_color = COLORS["success"] if pct >= 0 else COLORS["danger"]
 
         if sig == "BUY":
             sig_color = COLORS["success"]
@@ -63,8 +78,8 @@ def _render_simple(scored_tickers: list, max_rows: int, has_recs: bool):
             f'<div style="min-width:65px;">'
             f'<span style="background:{sig_bg};color:{sig_color};padding:3px 10px;border-radius:6px;'
             f'font-size:11px;font-weight:700;">{sig}</span></div>'
-            f'<div style="min-width:90px;color:{COLORS["text"]};font-size:14px;">${pick.price:.2f}</div>'
-            f'<div style="min-width:75px;color:{change_color};font-size:13px;font-weight:500;">{arrow}{pick.pct_change:.1f}%</div>'
+            f'<div style="min-width:90px;color:{COLORS["text"]};font-size:14px;">${price:.2f}</div>'
+            f'<div style="min-width:75px;color:{change_color};font-size:13px;font-weight:500;">{arrow}{pct:.1f}%</div>'
             f'<div style="flex:1;color:{COLORS["text_secondary"]};font-size:12px;">{action}</div>'
             f'</div>'
         )
@@ -96,15 +111,19 @@ def _render_advanced(scored_tickers: list, max_rows: int, has_recs: bool):
     """Advanced leaderboard with full technical data + signal column."""
     rows = []
     for i, pick in enumerate(scored_tickers[:max_rows], 1):
-        arrow = "+" if pick.pct_change >= 0 else ""
+        price = _safe(pick.price)
+        pct = _safe(pick.pct_change)
+        rvol = _safe(pick.rel_volume)
+        score = _safe(pick.composite_score)
+        arrow = "+" if pct >= 0 else ""
         row = {
             "#": i,
             "Ticker": pick.ticker,
-            "Score": round(pick.composite_score, 0),
+            "Score": round(score, 0),
             "Signal": "—",
-            "Price": f"${pick.price:.2f}",
-            "Change": f"{arrow}{pick.pct_change:.1f}%",
-            "RVol": f"{pick.rel_volume:.1f}x",
+            "Price": f"${price:.2f}",
+            "Change": f"{arrow}{pct:.1f}%",
+            "RVol": f"{rvol:.1f}x",
             "Regime": pick.regime[:14],
             "Phase": pick.kinematic_phase[:10],
             "Direction": pick.direction,
