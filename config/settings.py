@@ -3,9 +3,10 @@ Global configuration for Scalp Assistant v4.
 All thresholds, weights, ticker universes, asset class configs, and API settings.
 """
 import os
+from typing import Optional
 
 
-def get_secret(key: str, default: str | None = None) -> str | None:
+def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     """Get a secret from Streamlit Cloud secrets first, then fall back to os.environ."""
     try:
         import streamlit as st
@@ -27,13 +28,13 @@ TICKER_UNIVERSE = [
     # High-momentum tech
     "PLTR", "ARM", "SMCI", "AVGO", "AMD", "MSTR", "COIN", "HOOD", "RBLX", "SNAP", "UBER",
     # Biotech / Healthcare
-    "HIMS", "BBIO", "MRNA", "BNTX", "CRSP", "EDIT", "BEAM", "RXRX", "NVAX", "SAVA", "CARA",
+    "HIMS", "BBIO", "MRNA", "BNTX", "CRSP", "EDIT", "BEAM", "RXRX", "NVAX",
     # Financials / Fintech
-    "SOFI", "AFRM", "UPST", "SQ", "PYPL", "NU", "MELI", "LC",
+    "SOFI", "AFRM", "UPST", "XYZ", "PYPL", "NU", "MELI", "LC",  # SQ renamed to XYZ (Block)
     # Energy
     "XOM", "CVX", "OXY", "SLB", "MPC", "VLO", "PSX", "FANG", "DVN",
     # Consumer / Retail
-    "ONON", "NKE", "LULU", "CROX", "DECK", "SKX", "SHAK", "BROS",
+    "ONON", "NKE", "LULU", "CROX", "DECK", "SHAK", "BROS",
     # Semiconductors
     "INTC", "QCOM", "MU", "LRCX", "KLAC", "AMAT", "MRVL", "ON",
     # Growth / Speculative
@@ -41,7 +42,23 @@ TICKER_UNIVERSE = [
     # Big cap value
     "NVO", "LLY", "PFE", "ABBV", "BMY", "JNJ", "ORCL", "CRM", "NOW", "SNOW",
     # Meme / high short interest
-    "GME", "AMC", "SPCE", "NKLA", "OPEN",
+    "GME", "AMC", "SPCE", "OPEN",
+    # AI Hedge Fund — Automotive / Mobility
+    "MBLY", "AEHR", "JOBY",
+    # AI Hedge Fund — Healthcare / Life Sciences
+    "TEM",
+    # AI Hedge Fund — Industrial / Automation
+    "GE", "HON",
+    # AI Hedge Fund — Media / Consumer AI
+    "NFLX",
+    # AI Hedge Fund — Retail / Cloud / Data
+    "NBIS",
+    # AI Hedge Fund — Robotics / Physical AI
+    "RCAT", "ONDS", "SERV",
+    # AI Hedge Fund — Telco / Networking
+    "ANET", "COHR", "LITE",
+    # AI Hedge Fund — Advanced Compute
+    "ALAB", "IREN",
     # Sector ETFs
     "XLF", "XLE", "XLK", "ARKK",
     # Crypto proxies
@@ -77,8 +94,22 @@ CRYPTO_UNIVERSE = [
     "ADA-USD", "AVAX-USD", "DOT-USD", "LINK-USD",
     "UNI-USD", "ATOM-USD", "APT-USD", "ARB-USD", "OP-USD",
     "NEAR-USD", "FIL-USD", "RENDER-USD", "FET-USD", "INJ-USD",
-    "MATIC-USD",
+    "POL-USD",  # formerly MATIC
 ]
+
+# ─────────────────────────────────────────────────────────────
+#  STABLECOIN UNIVERSE (depeg monitoring)
+# ─────────────────────────────────────────────────────────────
+STABLECOIN_UNIVERSE = [
+    "USDT-USD", "USDC-USD", "DAI-USD", "BUSD-USD",
+    "TUSD-USD", "FRAX-USD", "PYUSD-USD",
+]
+
+# Stablecoin depeg thresholds
+STABLECOIN_PEG_PRICE = 1.00
+STABLECOIN_WARN_DEVIATION = 0.005     # 0.5% — yellow alert
+STABLECOIN_ALERT_DEVIATION = 0.01     # 1.0% — red alert
+STABLECOIN_EMERGENCY_DEVIATION = 0.03  # 3.0% — emergency
 
 # ─────────────────────────────────────────────────────────────
 #  FOREX UNIVERSE (yfinance format: PAIR=X)
@@ -157,6 +188,15 @@ ASSET_CLASS_CONFIG = {
         "news_category": "general",
         "label": "Commodities",
     },
+    "stablecoins": {
+        "universe_key": "STABLECOIN_UNIVERSE",
+        "trading_days_year": 365,
+        "minutes_per_day": 1440,
+        "market_hours": False,
+        "has_options": False,
+        "news_category": "crypto",
+        "label": "Stablecoins",
+    },
 }
 
 def get_universe(asset_class: str) -> list:
@@ -174,6 +214,7 @@ WEIGHT_TECHNICAL = 0.20
 WEIGHT_CATALYST = 0.18
 WEIGHT_STATISTICAL = 0.16
 WEIGHT_ML = 0.12
+WEIGHT_SEFIROT = 0.00  # Off by default — enable after validating feature predictiveness
 # WEIGHT_SOCIAL = 0.12 (defined below in Social Intelligence section)
 
 # ─────────────────────────────────────────────────────────────
@@ -258,6 +299,44 @@ WAR_RISK_HIGH = 75
 INFLUENCER_HIGH_IMPACT = 80       # flag if influencer impact >= this
 INFLUENCER_MIN_RELEVANCE = 40     # minimum score to display
 
+# ─────────────────────────────────────────────────────────────
+#  AI HEDGE FUND WATCHLIST (sector-grouped)
+# ─────────────────────────────────────────────────────────────
+AI_HEDGE_FUND_TICKERS = {
+    "Automotive / Mobility": ["MBLY", "AEHR", "JOBY"],
+    "Healthcare / Life Sciences": ["TEM", "HIMS"],
+    "Financial / AI Software": ["PLTR"],
+    "Industrial / Automation": ["GE", "HON"],
+    "Media / Consumer AI": ["META", "GOOGL", "NFLX"],
+    "Retail / Cloud / Data": ["AMZN", "NBIS"],
+    "Robotics / Physical AI": ["TSLA", "RCAT", "ONDS", "SERV"],
+    "Telco / Networking": ["ANET", "COHR", "LITE"],
+    "Advanced Compute": ["NVDA", "AMD", "AVGO", "INTC", "ALAB", "IREN"],
+}
+
+# ─────────────────────────────────────────────────────────────
+#  QUANT FORMULA THRESHOLDS (Six-Formula Engine)
+# ─────────────────────────────────────────────────────────────
+KELLY_MAX_FRACTION = 0.25         # Cap at quarter-Kelly (ruin protection)
+QUANT_ALIGNMENT_MIN = 4           # Minimum formulas agreeing for "aligned"
+QUANT_EV_GAP_THRESHOLD = 0.5     # EV gap > 0.5% is actionable
+QUANT_KL_MAX_STABLE = 0.5        # KL divergence below this = stable signal
+STOIKOV_RISK_AVERSION = 0.1      # Gamma parameter for Stoikov reservation price
+
+# ─────────────────────────────────────────────────────────────
+#  WHALE DETECTION (Unusual Whales methodology — approximated)
+# ─────────────────────────────────────────────────────────────
+WHALE_VOLUME_SIGMA = 2.5         # Std devs above mean volume for "unusual"
+WHALE_GOLDEN_VOLUME_MULT = 5.0   # Volume multiplier for golden sweep equivalent
+WHALE_BLOCK_MIN_DOLLAR = 500000  # Minimum dollar volume for block detection
+WHALE_SWEEP_CONSECUTIVE = 3      # Consecutive high-volume bars for sweep pattern
+
+# ─────────────────────────────────────────────────────────────
+#  BEST PLAYS SETTINGS
+# ─────────────────────────────────────────────────────────────
+BEST_PLAYS_MIN_SCORE = 55        # Minimum composite score for best plays
+BEST_PLAYS_MAX_RESULTS = 5       # Maximum plays to show
+
 # Live monitor social refresh interval (cycles)
 SOCIAL_REFRESH_CYCLES = 5         # refresh social intel every N cycles
 GEOPOLITICAL_REFRESH_CYCLES = 10  # refresh geopolitical every N cycles
@@ -311,7 +390,166 @@ NOTIFY_ON_SPARK = True
 NOTIFY_ON_DIP = True
 NOTIFY_MIN_SCORE = 55
 NOTIFY_QUIET_HOURS = (22, 7)      # Don't notify between 10pm-7am
-NOTIFY_COOLDOWN_SECONDS = 600     # 10 min between same-ticker alerts
+NOTIFY_COOLDOWN_SECONDS = 1800    # 30 min between same-ticker alerts (was 10 min)
+
+# Crypto scanner settings
+CRYPTO_SCAN_INTERVAL_MIN = 5      # Crypto scans every 5 min (24/7)
+STOCK_SCAN_INTERVAL_MIN = 15      # Stocks/ETFs scan every 15 min (market hours)
+
+# Per-asset-class daily alert caps
+DAILY_ALERT_CAP_STOCKS = 15
+DAILY_ALERT_CAP_CRYPTO = 20       # Higher cap for 24/7 market
+
+# ─────────────────────────────────────────────────────────────
+#  TRADINGVIEW MCP INTEGRATION
+# ─────────────────────────────────────────────────────────────
+TV_MCP_ENABLED = True
+TV_CDP_URL = "http://localhost:9222"
+TV_SCREENSHOT_TIMEFRAME_STOCKS = "15"
+TV_SCREENSHOT_TIMEFRAME_CRYPTO = "5"
+TV_SCREENSHOT_TIMEFRAME_SWING = "D"
+TV_BATCH_DELAY_MS = 2000
+TV_MAX_CANDIDATES = 15            # Max tickers to validate via TV per scan
+TV_INDICATOR_TEMPLATE = [
+    "Relative Strength Index",
+    "MACD",
+    "Volume",
+]
+
+# yfinance ticker → TradingView symbol mapping
+TV_TICKER_MAP = {
+    # Index ETFs
+    "SPY": "AMEX:SPY", "QQQ": "NASDAQ:QQQ", "IWM": "AMEX:IWM", "DIA": "AMEX:DIA",
+    "VTI": "AMEX:VTI", "VOO": "AMEX:VOO",
+    # Mega cap tech
+    "NVDA": "NASDAQ:NVDA", "AAPL": "NASDAQ:AAPL", "MSFT": "NASDAQ:MSFT",
+    "AMZN": "NASDAQ:AMZN", "META": "NASDAQ:META", "GOOGL": "NASDAQ:GOOGL",
+    "TSLA": "NASDAQ:TSLA",
+    # High-momentum tech
+    "PLTR": "NYSE:PLTR", "ARM": "NASDAQ:ARM", "SMCI": "NASDAQ:SMCI",
+    "AVGO": "NASDAQ:AVGO", "AMD": "NASDAQ:AMD", "MSTR": "NASDAQ:MSTR",
+    "COIN": "NASDAQ:COIN", "HOOD": "NASDAQ:HOOD", "RBLX": "NYSE:RBLX",
+    "SNAP": "NYSE:SNAP", "UBER": "NYSE:UBER",
+    # Biotech / Healthcare
+    "HIMS": "NYSE:HIMS", "BBIO": "NASDAQ:BBIO", "MRNA": "NASDAQ:MRNA",
+    "BNTX": "NASDAQ:BNTX", "CRSP": "NASDAQ:CRSP", "EDIT": "NASDAQ:EDIT",
+    "BEAM": "NASDAQ:BEAM", "RXRX": "NASDAQ:RXRX", "NVAX": "NASDAQ:NVAX",
+    # Financials / Fintech
+    "SOFI": "NASDAQ:SOFI", "AFRM": "NASDAQ:AFRM", "UPST": "NASDAQ:UPST",
+    "XYZ": "NYSE:XYZ", "PYPL": "NASDAQ:PYPL", "NU": "NYSE:NU",
+    "MELI": "NASDAQ:MELI", "LC": "NYSE:LC",
+    # Energy
+    "XOM": "NYSE:XOM", "CVX": "NYSE:CVX", "OXY": "NYSE:OXY", "SLB": "NYSE:SLB",
+    "MPC": "NYSE:MPC", "VLO": "NYSE:VLO", "PSX": "NYSE:PSX", "FANG": "NASDAQ:FANG",
+    "DVN": "NYSE:DVN",
+    # Consumer / Retail
+    "ONON": "NYSE:ONON", "NKE": "NYSE:NKE", "LULU": "NASDAQ:LULU",
+    "CROX": "NASDAQ:CROX", "DECK": "NYSE:DECK", "SHAK": "NYSE:SHAK", "BROS": "NYSE:BROS",
+    # Semiconductors
+    "INTC": "NASDAQ:INTC", "QCOM": "NASDAQ:QCOM", "MU": "NASDAQ:MU",
+    "LRCX": "NASDAQ:LRCX", "KLAC": "NASDAQ:KLAC", "AMAT": "NASDAQ:AMAT",
+    "MRVL": "NASDAQ:MRVL", "ON": "NASDAQ:ON",
+    # Growth / Speculative
+    "IONQ": "NYSE:IONQ", "RGTI": "NASDAQ:RGTI", "QBTS": "NYSE:QBTS",
+    "LUNR": "NASDAQ:LUNR", "RDW": "NYSE:RDW", "RKLB": "NASDAQ:RKLB",
+    "ASTS": "NASDAQ:ASTS", "ACHR": "NASDAQ:ACHR",
+    # Big cap value
+    "NVO": "NYSE:NVO", "LLY": "NYSE:LLY", "PFE": "NYSE:PFE", "ABBV": "NYSE:ABBV",
+    "BMY": "NYSE:BMY", "JNJ": "NYSE:JNJ", "ORCL": "NYSE:ORCL", "CRM": "NYSE:CRM",
+    "NOW": "NYSE:NOW", "SNOW": "NYSE:SNOW",
+    # Meme / short interest
+    "GME": "NYSE:GME", "AMC": "NYSE:AMC", "SPCE": "NYSE:SPCE", "OPEN": "NASDAQ:OPEN",
+    # AI Hedge Fund picks
+    "MBLY": "NASDAQ:MBLY", "AEHR": "NASDAQ:AEHR", "JOBY": "NYSE:JOBY",
+    "TEM": "NASDAQ:TEM", "GE": "NYSE:GE", "HON": "NASDAQ:HON", "NFLX": "NASDAQ:NFLX",
+    "NBIS": "NASDAQ:NBIS", "RCAT": "NASDAQ:RCAT", "ONDS": "NYSE:ONDS",
+    "SERV": "NASDAQ:SERV", "ANET": "NYSE:ANET", "COHR": "NYSE:COHR",
+    "LITE": "NASDAQ:LITE", "ALAB": "NASDAQ:ALAB", "IREN": "NASDAQ:IREN",
+    # Sector ETFs
+    "XLF": "AMEX:XLF", "XLE": "AMEX:XLE", "XLK": "AMEX:XLK", "ARKK": "AMEX:ARKK",
+    "XLV": "AMEX:XLV", "XLI": "AMEX:XLI", "XLU": "AMEX:XLU", "XLP": "AMEX:XLP",
+    "XLB": "AMEX:XLB", "XLRE": "AMEX:XLRE",
+    # Thematic ETFs
+    "ARKG": "AMEX:ARKG", "ARKF": "AMEX:ARKF", "ARKW": "AMEX:ARKW",
+    "BOTZ": "NASDAQ:BOTZ", "LIT": "AMEX:LIT", "TAN": "AMEX:TAN", "ICLN": "NASDAQ:ICLN",
+    # Fixed Income ETFs
+    "TLT": "NASDAQ:TLT", "IEF": "NASDAQ:IEF", "SHY": "NASDAQ:SHY",
+    "HYG": "AMEX:HYG", "LQD": "AMEX:LQD", "AGG": "AMEX:AGG",
+    # International ETFs
+    "EEM": "AMEX:EEM", "FXI": "AMEX:FXI", "EWJ": "AMEX:EWJ", "EWZ": "AMEX:EWZ",
+    "INDA": "AMEX:INDA", "VWO": "AMEX:VWO",
+    # Volatility / Leveraged
+    "UVXY": "AMEX:UVXY", "VXX": "AMEX:VXX",
+    "TQQQ": "NASDAQ:TQQQ", "SQQQ": "NASDAQ:SQQQ", "SOXL": "AMEX:SOXL", "SOXS": "AMEX:SOXS",
+    # Crypto proxies
+    "MARA": "NASDAQ:MARA", "RIOT": "NASDAQ:RIOT", "CLSK": "NASDAQ:CLSK",
+    # Commodities (ETF proxies)
+    "GLD": "AMEX:GLD", "SLV": "AMEX:SLV", "GDX": "AMEX:GDX",
+    "USO": "AMEX:USO", "UCO": "AMEX:UCO", "XOP": "AMEX:XOP", "UNG": "AMEX:UNG",
+    "WEAT": "AMEX:WEAT", "CORN": "AMEX:CORN", "SOYB": "AMEX:SOYB",
+    "DBA": "AMEX:DBA", "DBC": "AMEX:DBC", "PDBC": "AMEX:PDBC",
+    "COPX": "AMEX:COPX", "URA": "AMEX:URA",
+    # Crypto → TradingView (yfinance BTC-USD → COINBASE:BTCUSD)
+    "BTC-USD": "COINBASE:BTCUSD", "ETH-USD": "COINBASE:ETHUSD",
+    "SOL-USD": "COINBASE:SOLUSD", "XRP-USD": "COINBASE:XRPUSD",
+    "DOGE-USD": "COINBASE:DOGEUSD", "ADA-USD": "COINBASE:ADAUSD",
+    "AVAX-USD": "COINBASE:AVAXUSD", "DOT-USD": "COINBASE:DOTUSD",
+    "LINK-USD": "COINBASE:LINKUSD", "UNI-USD": "COINBASE:UNIUSD",
+    "ATOM-USD": "COINBASE:ATOMUSD", "APT-USD": "COINBASE:APTUSD",
+    "ARB-USD": "COINBASE:ARBUSD", "OP-USD": "COINBASE:OPUSD",
+    "NEAR-USD": "COINBASE:NEARUSD", "FIL-USD": "COINBASE:FILUSD",
+    "RENDER-USD": "COINBASE:RENDERUSD", "FET-USD": "COINBASE:FETUSD",
+    "INJ-USD": "COINBASE:INJUSD", "POL-USD": "COINBASE:POLUSD",
+    # Forex
+    "EURUSD=X": "FX:EURUSD", "GBPUSD=X": "FX:GBPUSD", "USDJPY=X": "FX:USDJPY",
+    "USDCHF=X": "FX:USDCHF", "AUDUSD=X": "FX:AUDUSD", "USDCAD=X": "FX:USDCAD",
+    "NZDUSD=X": "FX:NZDUSD", "EURGBP=X": "FX:EURGBP", "EURJPY=X": "FX:EURJPY",
+    "GBPJPY=X": "FX:GBPJPY", "DX-Y.NYB": "TVC:DXY",
+}
+
+# ─────────────────────────────────────────────────────────────
+#  SCALP ENGINE
+# ─────────────────────────────────────────────────────────────
+SCALP_ENABLED = True
+SCALP_MONITOR_INTERVAL_SEC = 120      # 2 min between scalp checks
+SCALP_MAX_HOT_LIST = 8                # max tickers to watch
+SCALP_MIN_RVOL = 2.0                  # minimum relative volume for hot list
+SCALP_MIN_RR = 1.5                    # minimum risk:reward
+SCALP_ATR_STOP_MULT = 0.75            # tighter stops for scalps (vs 1.5x normal)
+SCALP_ATR_TARGET1_MULT = 1.0          # 50% scale-out target
+SCALP_ATR_TARGET2_MULT = 2.0          # full exit target
+SCALP_ORB_START = "09:30"             # Opening range start (ET)
+SCALP_ORB_END = "09:45"               # Opening range end (ET)
+SCALP_ORB_WINDOW_END = "10:30"        # Stop trading ORB after this
+SCALP_VWAP_TOLERANCE = 0.0015         # 0.15% distance from VWAP = pullback
+SCALP_COOLDOWN_SECONDS = 300          # 5 min between same-ticker scalp alerts
+SCALP_DAILY_CAP = 10                  # max scalp alerts per day
+
+# ─────────────────────────────────────────────────────────────
+#  OPTIONS SCALP ENGINE
+# ─────────────────────────────────────────────────────────────
+OPT_SCALP_ENABLED = True              # master toggle for options scalp detectors
+OPT_SCALP_INTERVAL_SEC = 60           # check every 60s (faster than stock scalps)
+OPT_SCALP_MIN_VOLUME = 50             # min option contract volume
+OPT_SCALP_MIN_OI = 100                # min open interest
+OPT_SCALP_MAX_SPREAD_PCT = 0.10       # max 10% bid/ask spread
+OPT_SCALP_IV_RANK_MIN = 20            # skip if IV too low (premiums tiny)
+OPT_SCALP_IV_RANK_MAX = 80            # skip if IV too high (crush risk)
+OPT_SCALP_MIN_DELTA = 0.30            # avoid far OTM
+OPT_SCALP_MAX_DELTA = 0.65            # avoid deep ITM
+OPT_SCALP_0DTE_CUTOFF = "14:00"       # no new 0DTE after 2pm ET
+OPT_SCALP_PREMIUM_MAX = 500           # max premium per contract ($)
+OPT_SCALP_DAILY_CAP = 8               # max options scalp alerts per day
+
+# ─────────────────────────────────────────────────────────────
+#  ML TRADINGVIEW FEATURE INTEGRATION
+# ─────────────────────────────────────────────────────────────
+ML_TV_FEATURES_ENABLED = True         # toggle TV-equivalent technical features in ML
+ML_TV_BLEND_ENABLED = True            # blend live TV values at prediction time
+ML_TV_BLEND_WEIGHT = 0.7              # weight for TV value vs computed (0-1)
+ML_MODEL_ARCHIVE_ENABLED = True       # archive models before retrain
+ML_MODEL_ARCHIVE_KEEP = 4             # number of model archives to keep
+ML_RETRAIN_LOOKBACK_DAYS = 730        # default training data window
 
 # ─────────────────────────────────────────────────────────────
 #  FREE API ENDPOINTS (no signup required)

@@ -2,6 +2,7 @@
 Expanded Reddit fetcher — political, world news, and economic discussions
 via Reddit's public JSON API (no authentication required).
 """
+from __future__ import annotations
 import logging
 import re
 import time

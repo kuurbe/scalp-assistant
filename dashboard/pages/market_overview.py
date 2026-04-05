@@ -18,7 +18,9 @@ from dashboard import data_bridge
 
 
 def _run_scan_with_progress(scan_key: str, is_simple: bool):
-    """Run stock scan with a progress bar for faster perceived loading."""
+    """Run stock scan with a progress bar for faster perceived loading.
+    Uses batch OHLCV download + prefetched shared data to avoid duplicate fetches.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from config import settings
     from modes.morning_scan import _analyze_ticker
@@ -28,7 +30,10 @@ def _run_scan_with_progress(scan_key: str, is_simple: bool):
         st.session_state[scan_key] = []
         return
 
-    # Pre-fetch shared data
+    total = len(universe)
+    progress = st.progress(0, text="Downloading market data...")
+
+    # Pre-fetch shared data + batch OHLCV concurrently
     shared = data_bridge._prefetch_shared_data("stocks")
     macro_regime = shared.get("macro", "NEUTRAL")
     reddit_data = shared.get("reddit", {})
@@ -36,8 +41,10 @@ def _run_scan_with_progress(scan_key: str, is_simple: bool):
     war_watch = shared.get("war", {})
     influencer_pulse = shared.get("influencer", {})
 
-    total = len(universe)
-    progress = st.progress(0, text="Scanning markets...")
+    progress.progress(0.1, text="Batch downloading OHLCV...")
+    daily_dict, intraday_dict = data_bridge._batch_fetch_ohlcv(universe)
+
+    progress.progress(0.2, text="Analyzing tickers...")
     results = []
     done = 0
 
@@ -45,7 +52,8 @@ def _run_scan_with_progress(scan_key: str, is_simple: bool):
         futures = {
             pool.submit(
                 _analyze_ticker, ticker, macro_regime, reddit_data, {},
-                political_pulse, war_watch, influencer_pulse, "stocks"
+                political_pulse, war_watch, influencer_pulse, "stocks",
+                daily_dict.get(ticker), intraday_dict.get(ticker)
             ): ticker
             for ticker in universe
         }
@@ -53,18 +61,20 @@ def _run_scan_with_progress(scan_key: str, is_simple: bool):
             done += 1
             ticker = futures[future]
             try:
-                result = future.result()
+                result = future.result(timeout=30)
                 if result:
                     results.append(result)
             except Exception:
                 pass
             if done % 4 == 0 or done == total:
-                pct = done / total
+                pct = 0.2 + (done / total * 0.8)
                 progress.progress(pct, text=f"Scanning {ticker}... ({done}/{total})")
 
     progress.empty()
     results.sort(key=lambda x: x.composite_score, reverse=True)
     st.session_state[scan_key] = results
+    # Share results with stocks page too
+    st.session_state["stocks_scan_results"] = results
 
 
 def _risk_color(level: str) -> str:

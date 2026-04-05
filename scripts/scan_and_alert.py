@@ -181,6 +181,108 @@ def _format_swing_trade(pick, rec: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+#  Crypto-specific alert formatters
+# ─────────────────────────────────────────────────────────────
+
+def _format_crypto_trade(pick, rec: dict) -> str:
+    """Format a short-term crypto trade alert with whale/quant signals."""
+    signal = rec.get("signal", "HOLD")
+    conf = rec.get("confidence", 0)
+    dir_emoji = "📈" if pick.direction == "LONG" else "📉"
+
+    ml_conf = compute_ml_confidence(pick)
+    ml_tier = get_confidence_tier(ml_conf)
+
+    # Whale badges
+    whale_badges = []
+    if getattr(pick, "whale_golden_sweep", False):
+        whale_badges.append("⚡ Golden Sweep")
+    elif getattr(pick, "whale_sweep_detected", False):
+        whale_badges.append("🐋 Sweep")
+    if getattr(pick, "whale_volume_sigma", 0) >= 2.5:
+        whale_badges.append(f"📊 Vol {pick.whale_volume_sigma:.1f}σ")
+    whale_line = f"\n   Whale: {' | '.join(whale_badges)}" if whale_badges else ""
+
+    # Quant signals
+    quant_line = ""
+    q_score = getattr(pick, "quant_score", 0)
+    q_aligned = getattr(pick, "quant_aligned", False)
+    q_n = getattr(pick, "quant_n_agreeing", 0)
+    if q_score > 0:
+        align_badge = "✅" if q_aligned else "⚠️"
+        quant_line = f"\n   Quant: {align_badge} {q_n}/6 aligned (score {q_score:.0f})"
+
+    # BTC correlation
+    btc_corr = getattr(pick, "btc_correlation_20d", 0)
+    btc_line = f"\n   BTC Corr: {btc_corr:.2f}" if btc_corr != 0 else ""
+
+    # Entry/stop/target
+    levels = ""
+    if getattr(pick, "entry_price", 0) > 0:
+        levels = f"\n   Entry: <code>${pick.entry_price:.2f}</code> → Stop: <code>${pick.stop_price:.2f}</code> → Target: <code>${pick.target_price:.2f}</code>  (R:R {pick.risk_reward:.1f}x)"
+
+    # Position sizing (Kelly)
+    kelly = getattr(pick, "kelly_fraction", 0)
+    kelly_line = f"\n   Kelly Size: {kelly*100:.1f}% of bankroll" if kelly > 0.01 else ""
+
+    reasons = rec.get("reasons", [])[:2]
+    reasons_str = "\n".join(f"   • {r}" for r in reasons) if reasons else ""
+
+    base = (
+        f"\n{dir_emoji} <b>CRYPTO TRADE — {pick.ticker.replace('-USD', '')}</b>  ({signal} {conf}%)\n"
+        f"   Price: <code>${pick.price:.2f}</code> ({pick.pct_change:+.1f}%)  |  Score: {pick.composite_score:.0f}\n"
+        f"   Phase: {pick.kinematic_phase}  |  RVOL: {pick.rel_volume:.1f}x  |  RSI: {pick.rsi:.0f}\n"
+        f"   ML: {ml_tier} ({ml_conf:.0f}%)"
+        f"{whale_line}{quant_line}{btc_line}{levels}{kelly_line}"
+    )
+    if reasons_str:
+        base += f"\n{reasons_str}"
+    return base
+
+
+def _format_crypto_investment(pick, rec: dict) -> str:
+    """Format a longer-term crypto investment opportunity."""
+    conf = rec.get("confidence", 0)
+    hurst = getattr(pick, "hurst", 0.5)
+
+    # Investment label based on signal strength
+    score = pick.composite_score
+    if score >= 65 and hurst >= 0.55:
+        label = "ACCUMULATE"
+        emoji = "💎"
+    elif score >= 55:
+        label = "WATCH"
+        emoji = "👀"
+    else:
+        label = "MONITOR"
+        emoji = "📋"
+
+    # Quant alignment
+    q_aligned = getattr(pick, "quant_aligned", False)
+    q_n = getattr(pick, "quant_n_agreeing", 0)
+    align_badge = f"✅ {q_n}/6" if q_aligned else f"⚠️ {q_n}/6"
+
+    # BTC correlation
+    btc_corr = getattr(pick, "btc_correlation_20d", 0)
+    btc_line = f"  |  BTC Corr: {btc_corr:.2f}" if btc_corr != 0 else ""
+
+    # Regime context
+    regime = getattr(pick, "regime", "UNKNOWN")
+
+    reasons = rec.get("reasons", [])[:2]
+    reasons_str = "\n".join(f"   • {r}" for r in reasons) if reasons else ""
+
+    base = (
+        f"\n{emoji} <b>{label} — {pick.ticker.replace('-USD', '')}</b>  (Conf: {conf}%)\n"
+        f"   Price: <code>${pick.price:.2f}</code> ({pick.pct_change:+.1f}%)  |  Score: {pick.composite_score:.0f}\n"
+        f"   Regime: {regime}  |  Hurst: {hurst:.2f}  |  Quant: {align_badge}{btc_line}"
+    )
+    if reasons_str:
+        base += f"\n{reasons_str}"
+    return base
+
+
+# ─────────────────────────────────────────────────────────────
 #  Confluence scoring — multi-factor confirmation system
 #  Only alerts on trades with REAL confluence, not single signals
 # ─────────────────────────────────────────────────────────────
@@ -352,6 +454,18 @@ def _compute_confluence(pick, rec: dict) -> dict:
         points += 0.5
         flags.append(f"Decent score ({score:.0f})")
 
+    # 8. TradingView indicator confirmation
+    tv_conf = getattr(pick, "tv_confirmation", 0)
+    if tv_conf >= 80:
+        points += 1.5
+        flags.append(f"TV confirmed ({tv_conf:.0f}%)")
+    elif tv_conf >= 60:
+        points += 1.0
+        flags.append(f"TV partial ({tv_conf:.0f}%)")
+    elif tv_conf >= 40:
+        points += 0.5
+        flags.append(f"TV weak ({tv_conf:.0f}%)")
+
     # ── TIER ASSIGNMENT ──
     # A+: 5+ confluence points — alert always (even dead zone)
     # A:  3.5+ confluence points — alert during prime + active windows
@@ -422,7 +536,15 @@ def classify_setup(pick, rec: dict, asset_class: str = "stocks") -> list:
     if not types and tier == "A+":
         types.append("swing")
 
-    # OPTIONS: attach if available and signal is clear
+    # CRYPTO INVESTMENT: strong long-term signals (no options for crypto)
+    if asset_class == "crypto":
+        hurst = getattr(pick, "hurst", 0.5)
+        if (pick.regime in ("STRONG_TREND", "CLEAN_REVERSION")
+                and hurst >= 0.55 and score >= 55 and "day_trade" not in types):
+            types.append("investment")
+        return types
+
+    # OPTIONS: attach if available and signal is clear (stocks/ETFs only)
     has_option = (
         pick.option_exp_short
         and pick.option_exp_short != "N/A"
@@ -468,7 +590,26 @@ def scan_asset_class(asset_class: str) -> dict:
 
     log.info("  %d tickers scored for %s", len(picks), asset_class)
 
-    results = {"option_calls": [], "option_puts": [], "day_trades": [], "swings": [], "top_picks": []}
+    # Enrich top candidates with TradingView confirmation scores
+    try:
+        from signals.tradingview_bridge import is_tv_available, get_tv_indicators, compute_tv_confirmation
+        if is_tv_available():
+            tv_max = getattr(settings, "TV_MAX_CANDIDATES", 15)
+            top_candidates = [p for p in picks if p.composite_score >= 40][:tv_max]
+            if top_candidates:
+                log.info("  TV confirming %d candidates...", len(top_candidates))
+                for pick in top_candidates:
+                    tv_vals = get_tv_indicators(pick.ticker)
+                    if tv_vals:
+                        pick.tv_confirmation = compute_tv_confirmation(pick, tv_vals)
+                log.info("  TV confirmation done")
+    except Exception as e:
+        log.debug("TV confirmation skipped: %s", e)
+
+    results = {"option_calls": [], "option_puts": [], "day_trades": [], "swings": [],
+                "investments": [], "top_picks": []}
+
+    is_crypto = asset_class == "crypto"
 
     for pick in picks:
         try:
@@ -484,9 +625,13 @@ def scan_asset_class(asset_class: str) -> dict:
                 elif t == "option_put":
                     results["option_puts"].append(_format_option_alert(pick, rec))
                 elif t == "day_trade":
-                    results["day_trades"].append(_format_day_trade(pick, rec))
+                    formatter = _format_crypto_trade if is_crypto else _format_day_trade
+                    results["day_trades"].append(formatter(pick, rec))
                 elif t == "swing":
-                    results["swings"].append(_format_swing_trade(pick, rec))
+                    formatter = _format_crypto_investment if is_crypto else _format_swing_trade
+                    results["swings"].append(formatter(pick, rec))
+                elif t == "investment":
+                    results["investments"].append(_format_crypto_investment(pick, rec))
 
             # Track top picks for summary chart
             if types:
@@ -496,33 +641,59 @@ def scan_asset_class(asset_class: str) -> dict:
         except Exception as e:
             log.warning("  Error processing %s: %s", getattr(pick, "ticker", "?"), e)
 
+    # Run stablecoin depeg check alongside crypto scans
+    if asset_class == "crypto":
+        try:
+            from scripts.stablecoin_monitor import scan_stablecoins, dispatch_stablecoin_alerts
+            stable_events = scan_stablecoins()
+            if stable_events:
+                dispatch_stablecoin_alerts(stable_events)
+                log.info("  %d stablecoin depeg events detected", len(stable_events))
+        except Exception as e:
+            log.debug("Stablecoin monitor error: %s", e)
+
     return results
 
 
 def run_full_scan(asset_classes: list = None) -> None:
-    """Run the full scan across asset classes and dispatch alerts."""
+    """Run the full scan across asset classes and dispatch alerts.
+
+    Dispatches per asset class so crypto alerts route to the crypto Telegram channel.
+    """
     if not asset_classes:
         asset_classes = ["stocks", "etfs", "crypto"]
 
-    all_results = {
-        "option_calls": [],
-        "option_puts": [],
-        "day_trades": [],
-        "swings": [],
-        "top_picks": [],
-    }
-
     for ac in asset_classes:
         results = scan_asset_class(ac)
-        for key in all_results:
-            all_results[key].extend(results.get(key, []))
-
-    # Build and send Telegram messages by category
-    _dispatch_alerts(all_results)
+        _dispatch_alerts(results, asset_class=ac)
 
 
-def _send_candlestick_for_pick(pick) -> None:
-    """Fetch OHLCV and send a candlestick chart for a top pick via Telegram."""
+def _send_candlestick_for_pick(pick, chat_id=None) -> None:
+    """Send a chart for a top pick via Telegram. Tries TradingView first, falls back to matplotlib."""
+    # Try TradingView screenshot first (professional chart with indicators + levels)
+    try:
+        from signals.tradingview_bridge import capture_trade_screenshot, is_tv_available
+        if is_tv_available():
+            is_crypto = getattr(pick, "asset_class", "") == "crypto"
+            tf = settings.TV_SCREENSHOT_TIMEFRAME_CRYPTO if is_crypto else settings.TV_SCREENSHOT_TIMEFRAME_STOCKS
+            png = capture_trade_screenshot(
+                pick.ticker, tf,
+                entry=getattr(pick, "entry_price", 0),
+                stop=getattr(pick, "stop_price", 0),
+                target=getattr(pick, "target_price", 0),
+            )
+            if png:
+                caption = (
+                    f"📊 {pick.ticker} — TradingView {tf}min"
+                    f" | Score {getattr(pick, 'composite_score', 0):.0f}"
+                    f" | {getattr(pick, 'kinematic_phase', '')}"
+                )
+                send_telegram_photo(png, caption=caption, chat_id=chat_id)
+                return
+    except Exception:
+        log.debug("TV screenshot fallback for %s", getattr(pick, "ticker", "?"))
+
+    # Fallback: matplotlib candlestick
     try:
         import yfinance as yf
         df = yf.download(pick.ticker, period="3mo", interval="1d", progress=False)
@@ -539,58 +710,74 @@ def _send_candlestick_for_pick(pick) -> None:
             energy_regime=getattr(pick, "energy_regime", None),
         )
         if chart:
-            send_telegram_photo(chart, caption=f"📊 {pick.ticker} — Candlestick Chart")
+            send_telegram_photo(chart, caption=f"📊 {pick.ticker} — Candlestick Chart", chat_id=chat_id)
     except Exception as e:
         log.debug("Candlestick chart failed for %s: %s", getattr(pick, "ticker", "?"), e)
 
 
-_daily_alert_count = {"date": None, "count": 0}
+_daily_alert_count = {}  # Per-asset-class: {"stocks": {"date": ..., "count": 0}, ...}
 
-def _check_daily_cap() -> int:
-    """Return remaining alert slots today. Cap: 15 alerts/day."""
+def _check_daily_cap(asset_class: str = "stocks") -> int:
+    """Return remaining alert slots today for this asset class."""
     et = ZoneInfo("America/New_York")
     today = datetime.datetime.now(et).date()
-    if _daily_alert_count["date"] != today:
-        _daily_alert_count["date"] = today
-        _daily_alert_count["count"] = 0
-    return max(0, 15 - _daily_alert_count["count"])
+
+    if asset_class not in _daily_alert_count:
+        _daily_alert_count[asset_class] = {"date": None, "count": 0}
+
+    entry = _daily_alert_count[asset_class]
+    if entry["date"] != today:
+        entry["date"] = today
+        entry["count"] = 0
+
+    cap = settings.DAILY_ALERT_CAP_CRYPTO if asset_class in ("crypto", "stablecoins") else settings.DAILY_ALERT_CAP_STOCKS
+    return max(0, cap - entry["count"])
 
 
-def _dispatch_alerts(results: dict) -> None:
-    """Send categorized alerts to Telegram. Capped to avoid spam."""
-    remaining = _check_daily_cap()
+def _get_crypto_chat_id():
+    """Get the crypto Telegram chat ID, falling back to default."""
+    crypto_chat = settings.get_secret("TELEGRAM_CRYPTO_CHAT_ID")
+    return crypto_chat if crypto_chat else None
+
+
+def _dispatch_alerts(results: dict, asset_class: str = "stocks") -> None:
+    """Send categorized alerts to Telegram. Routes crypto to separate channel."""
+    remaining = _check_daily_cap(asset_class)
     if remaining <= 0:
-        log.info("Daily alert cap reached (15) — suppressing all alerts.")
+        log.info("Daily alert cap reached for %s — suppressing.", asset_class)
         return
 
-    # Hard caps per scan: max 2 options, 2 day trades, 3 swings = 7 max
-    calls = results["option_calls"][:2]
-    puts = results["option_puts"][:1]
-    days = results["day_trades"][:2]
-    swings = results["swings"][:3]
+    is_crypto = asset_class in ("crypto", "stablecoins")
+    chat_id = _get_crypto_chat_id() if is_crypto else None
 
-    total = len(calls) + len(puts) + len(days) + len(swings)
+    # Hard caps per scan
+    calls = results.get("option_calls", [])[:2]
+    puts = results.get("option_puts", [])[:1]
+    days = results.get("day_trades", [])[:3 if is_crypto else 2]
+    swings = results.get("swings", [])[:3]
+    investments = results.get("investments", [])[:3]
+
+    total = len(calls) + len(puts) + len(days) + len(swings) + len(investments)
 
     if total == 0:
-        log.info("No actionable setups found — no alerts to send.")
-        # Send a quiet "nothing found" update only at market open (ET)
-        et = ZoneInfo("America/New_York")
-        now = datetime.datetime.now(et)
-        if now.hour == 9 and now.minute < 45:
-            send_telegram(f"{_header()}\n\n😴 No actionable setups this scan.\nMarkets may be quiet — will scan again shortly.")
+        log.info("No actionable setups for %s — no alerts.", asset_class)
+        if not is_crypto:
+            et = ZoneInfo("America/New_York")
+            now = datetime.datetime.now(et)
+            if now.hour == 9 and now.minute < 45:
+                send_telegram(f"{_header()}\n\n😴 No actionable setups this scan.\nMarkets may be quiet — will scan again shortly.")
         return
 
     # Trim to daily cap
-    total_alerts = len(calls) + len(puts) + len(days) + len(swings)
-    if total_alerts > remaining:
-        # Prioritize: day trades > options > swings
+    if total > remaining:
         budget = remaining
         days = days[:budget]; budget -= len(days)
-        calls = calls[:max(0,budget)]; budget -= len(calls)
-        puts = puts[:max(0,budget)]; budget -= len(puts)
-        swings = swings[:max(0,budget)]
+        investments = investments[:max(0, budget)]; budget -= len(investments)
+        calls = calls[:max(0, budget)]; budget -= len(calls)
+        puts = puts[:max(0, budget)]; budget -= len(puts)
+        swings = swings[:max(0, budget)]
 
-    # ── Option Alerts (calls + puts together) ──
+    # ── Option Alerts (stocks/ETFs only) ──
     if calls or puts:
         msg = f"{_header()}\n\n<b>🎯 OPTIONS PLAYS</b>"
         if calls:
@@ -600,55 +787,376 @@ def _dispatch_alerts(results: dict) -> None:
             msg += f"\n\n<b>PUTS ({len(puts)})</b>"
             msg += "".join(puts)
         msg += f"\n\n{'━' * 30}\n⚠️ <i>Not financial advice. Always manage risk.</i>"
-        send_telegram(msg)
+        send_telegram(msg, chat_id=chat_id)
         log.info("Sent %d option alerts", len(calls) + len(puts))
 
-    # ── Day Trade Alerts ──
+    # ── Day Trade / Crypto Trade Alerts ──
     if days:
-        msg = f"{_header()}\n\n<b>⚡ DAY TRADES</b>\n<i>High momentum, intraday setups</i>"
+        if is_crypto:
+            msg = f"{_header()}\n\n<b>⚡ CRYPTO TRADES</b>\n<i>Short-term momentum setups</i>"
+        else:
+            msg = f"{_header()}\n\n<b>⚡ DAY TRADES</b>\n<i>High momentum, intraday setups</i>"
         msg += "".join(days)
-        msg += f"\n\n{'━' * 30}\n⚠️ <i>Tight stops. Exit same day.</i>"
-        send_telegram(msg)
-        log.info("Sent %d day trade alerts", len(days))
+        msg += f"\n\n{'━' * 30}\n⚠️ <i>Tight stops. Manage risk.</i>"
+        send_telegram(msg, chat_id=chat_id)
+        log.info("Sent %d %s trade alerts", len(days), "crypto" if is_crypto else "day")
 
-    # ── Swing Trade Alerts ──
+    # ── Swing / Investment Alerts ──
     if swings:
-        msg = f"{_header()}\n\n<b>🔵 SWING TRADES</b>\n<i>Multi-day trending setups</i>"
+        if is_crypto:
+            msg = f"{_header()}\n\n<b>🔵 CRYPTO SWING</b>\n<i>Multi-day trending setups</i>"
+        else:
+            msg = f"{_header()}\n\n<b>🔵 SWING TRADES</b>\n<i>Multi-day trending setups</i>"
         msg += "".join(swings)
         msg += f"\n\n{'━' * 30}\n⚠️ <i>Hold 2-10 days. Trail stops.</i>"
-        send_telegram(msg)
-        log.info("Sent %d swing trade alerts", len(swings))
+        send_telegram(msg, chat_id=chat_id)
+        log.info("Sent %d swing alerts", len(swings))
+
+    # ── Crypto Investment Opportunities ──
+    if investments:
+        msg = f"{_header()}\n\n<b>💎 INVESTMENT OPPORTUNITIES</b>\n<i>Longer-term accumulation signals</i>"
+        msg += "".join(investments)
+        msg += f"\n\n{'━' * 30}\n⚠️ <i>DYOR. DCA recommended over lump sum.</i>"
+        send_telegram(msg, chat_id=chat_id)
+        log.info("Sent %d investment alerts", len(investments))
 
     # ── Summary with chart ──
+    summary_parts = []
+    if calls or puts:
+        summary_parts.append(f"Calls: {len(calls)}  |  Puts: {len(puts)}")
+    if days:
+        label = "Crypto Trades" if is_crypto else "Day Trades"
+        summary_parts.append(f"{label}: {len(days)}")
+    if swings:
+        summary_parts.append(f"Swings: {len(swings)}")
+    if investments:
+        summary_parts.append(f"Investments: {len(investments)}")
+
     summary = (
         f"{_header()}\n\n"
-        f"<b>📊 SCAN SUMMARY</b>\n"
-        f"   Calls: {len(calls)}  |  Puts: {len(puts)}\n"
-        f"   Day Trades: {len(days)}  |  Swings: {len(swings)}\n"
+        f"<b>📊 {'CRYPTO' if is_crypto else 'SCAN'} SUMMARY</b>\n"
+        f"   {'  |  '.join(summary_parts)}\n"
         f"   Total Setups: {total}"
     )
 
-    # Try to send summary chart
     top_picks = results.get("top_picks", [])
     if top_picks:
-        # Sort by score, take top 10 for chart
         top_picks.sort(key=lambda x: x[1], reverse=True)
         chart_data = [(t[0], t[1], t[2]) for t in top_picks[:10]]
         chart_bytes = generate_summary_chart(chart_data)
         if chart_bytes:
-            send_telegram_photo(chart_bytes, caption=summary)
+            send_telegram_photo(chart_bytes, caption=summary, chat_id=chat_id)
             log.info("Sent summary with chart (%d top picks)", len(chart_data))
         else:
-            send_telegram(summary)
+            send_telegram(summary, chat_id=chat_id)
 
-        # Send candlestick charts for top 3 picks
         for _, _, _, pick in top_picks[:3]:
-            _send_candlestick_for_pick(pick)
+            _send_candlestick_for_pick(pick, chat_id=chat_id)
+
+        # Create TradingView price alerts for top 3 picks at entry/stop/target
+        try:
+            from signals.tradingview_bridge import create_price_alerts, is_tv_available
+            if is_tv_available():
+                for _, score, _, pick in top_picks[:3]:
+                    tier = "A+" if score >= 55 else "A"
+                    n = create_price_alerts(
+                        pick.ticker,
+                        entry=getattr(pick, "entry_price", 0),
+                        stop=getattr(pick, "stop_price", 0),
+                        target=getattr(pick, "target_price", 0),
+                        label=f"{tier} {getattr(pick, 'kinematic_phase', '')}",
+                    )
+                    if n:
+                        log.info("  Created %d TV alerts for %s", n, pick.ticker)
+        except Exception:
+            log.debug("TV alert creation skipped")
     else:
-        send_telegram(summary)
+        send_telegram(summary, chat_id=chat_id)
 
     # Track daily count
-    _daily_alert_count["count"] += total
+    _daily_alert_count.setdefault(asset_class, {"date": None, "count": 0})
+    _daily_alert_count[asset_class]["count"] += total
+
+    # ── Scalp Hot List (stocks/ETFs only, market hours) ──
+    if asset_class in ("stocks", "etfs") and getattr(settings, "SCALP_ENABLED", False):
+        try:
+            hot = _build_scalp_hot_list(picks)
+            if hot:
+                msg = _format_hot_list_alert(hot)
+                send_telegram(msg, chat_id=chat_id)
+                log.info("Sent scalp hot list (%d tickers)", len(hot))
+                # Store for scalp monitoring loop
+                global _current_hot_list
+                _current_hot_list = hot
+        except Exception as e:
+            log.debug("Hot list generation failed: %s", e)
+
+
+# ─────────────────────────────────────────────────────────────
+#  Scalp Hot List
+# ─────────────────────────────────────────────────────────────
+
+_current_hot_list = []  # Shared with scalp monitoring loop
+
+
+def get_current_hot_list() -> list:
+    """Return the current scalp hot list (called by scalp_engine)."""
+    return _current_hot_list
+
+
+def _build_scalp_hot_list(picks: list) -> list:
+    """Filter scored tickers down to scalp-ready candidates."""
+    min_rvol = getattr(settings, "SCALP_MIN_RVOL", 2.0)
+    min_rr = getattr(settings, "SCALP_MIN_RR", 1.5)
+    max_list = getattr(settings, "SCALP_MAX_HOT_LIST", 8)
+
+    hot = []
+    for pick in picks:
+        phase = getattr(pick, "kinematic_phase", "")
+        if phase not in ("IGNITION", "ACCELERATION"):
+            continue
+        if getattr(pick, "rel_volume", 0) < min_rvol:
+            continue
+        if getattr(pick, "risk_reward", 0) < min_rr:
+            continue
+        if getattr(pick, "composite_score", 0) < 40:
+            continue
+        hot.append(pick)
+
+    hot.sort(key=lambda p: p.composite_score, reverse=True)
+    return hot[:max_list]
+
+
+def _format_hot_list_alert(hot_list: list) -> str:
+    """Format a simplified scalp watchlist for Telegram."""
+    et = ZoneInfo("America/New_York")
+    now = datetime.datetime.now(et).strftime("%I:%M %p")
+
+    lines = [
+        f"<b>SCALP WATCHLIST</b> — {now} ET",
+        f"{'━' * 28}",
+    ]
+
+    for i, pick in enumerate(hot_list, 1):
+        ticker = pick.ticker
+        price = getattr(pick, "price", 0)
+        pct = getattr(pick, "pct_change", 0)
+        phase = getattr(pick, "kinematic_phase", "")
+        rvol = getattr(pick, "rel_volume", 0)
+        entry = getattr(pick, "entry_price", 0)
+        stop = getattr(pick, "stop_price", 0)
+        target = getattr(pick, "target_price", 0)
+
+        # Plain English momentum description
+        if phase == "IGNITION":
+            desc = "Momentum igniting, heavy volume"
+        elif phase == "ACCELERATION":
+            desc = "Accelerating, strong push"
+        else:
+            desc = "Active momentum"
+
+        if rvol >= 3.0:
+            desc += ", volume surge"
+
+        arrow = "+" if pct >= 0 else ""
+        lines.append(f"\n<b>{i}. {ticker}</b>  <code>${price:.2f}</code> ({arrow}{pct:.1f}%)")
+        lines.append(f"   {desc}")
+        if entry > 0 and stop > 0 and target > 0:
+            lines.append(f"   Buy: <code>${entry:.2f}</code>  Stop: <code>${stop:.2f}</code>  Target: <code>${target:.2f}</code>")
+
+        # Options hint if available
+        if getattr(pick, "option_exp_short", "") and pick.option_exp_short != "N/A":
+            strike = getattr(pick, "option_safe_strike", 0)
+            direction = getattr(pick, "option_direction", "CALL")
+            lines.append(f"   Option: {direction} <code>${strike:.0f}</code> exp {pick.option_exp_short}")
+
+    lines.append(f"\n{'━' * 28}")
+    lines.append("<i>Watch for pullbacks to buy zone. Tight stops.</i>")
+    return "\n".join(lines)
+
+
+def _format_scalp_entry(setup) -> str:
+    """Format a simplified scalp entry alert."""
+    ticker = setup.ticker
+    price = setup.entry_price
+    setup_names = {
+        "VWAP_PULLBACK": "Pulling back to support",
+        "MOMENTUM_BREAK": "Breaking out with volume",
+        "ORB_BREAKOUT": "Opening range breakout",
+        "IV_CRUSH_PUT": "Overbought, expecting pullback",
+        "GAMMA_SQUEEZE_CALL": "Gamma squeeze building",
+        "VWAP_RECLAIM_CALL": "Reclaiming VWAP with volume",
+        "BREAKDOWN_PUT": "Breaking down with momentum",
+        "BOLLINGER_SQUEEZE": "Volatility squeeze breakout",
+    }
+    reason = setup_names.get(setup.setup_type, setup.setup_type)
+
+    lines = [
+        f"<b>SCALP — Buy {ticker} now</b>",
+        f"{'━' * 28}",
+        f"Price: <code>${price:.2f}</code> — {reason}",
+        f"Stop: <code>${setup.stop_price:.2f}</code>",
+        f"Target 1: <code>${setup.target_1:.2f}</code> (take half off)",
+        f"Target 2: <code>${setup.target_2:.2f}</code> (let rest ride)",
+    ]
+
+    if setup.risk_reward > 0:
+        lines.append(f"Reward: {setup.risk_reward:.1f}x your risk")
+
+    if setup.urgency == "FADING":
+        lines.append("\n<i>Momentum fading — be quick or skip</i>")
+    elif setup.urgency == "NOW":
+        lines.append("\n<i>Strong setup — act now</i>")
+
+    return "\n".join(lines)
+
+
+def _format_options_scalp(setup) -> str:
+    """Format a plain English options scalp alert with dollar P&L at each target.
+
+    No jargon — dollar amounts, what happens at each price, and risk warnings.
+    """
+    scenarios = getattr(setup, "pnl_scenarios", {}) or {}
+    iv_rank = getattr(setup, "iv_rank", 0)
+    spread_pct = getattr(setup, "spread_pct", 0)
+
+    # Setup reason in plain English
+    setup_reasons = {
+        "IV_CRUSH_PUT": "overbought + expensive premium, expecting pullback",
+        "GAMMA_SQUEEZE_CALL": "approaching max pain, market makers hedging",
+        "VWAP_RECLAIM_CALL": "reclaiming VWAP with volume, intraday reversal",
+        "BREAKDOWN_PUT": "breaking below support with momentum",
+        "BOLLINGER_SQUEEZE": "volatility squeeze breakout",
+        "VWAP_PULLBACK": "pulling back to support",
+        "MOMENTUM_BREAK": "breaking out with volume",
+        "ORB_BREAKOUT": "opening range breakout",
+    }
+    reason = setup_reasons.get(setup.setup_type, setup.setup_type.replace("_", " ").lower())
+
+    lines = [
+        f"<b>OPTIONS SCALP — {setup.option_contract}</b>",
+        f"{'━' * 28}",
+        f"{setup.ticker} is {reason} at <code>${setup.entry_price:.2f}</code>",
+    ]
+
+    # Use P&L scenarios if available (real dollar amounts)
+    if scenarios:
+        cost = scenarios.get("entry_cost", 0)
+        cost_100 = scenarios.get("entry_cost_100", 0)
+        if cost > 0:
+            lines.append(f"Cost: ~<code>${cost:.2f}</code> (<code>${cost_100:.0f}</code>/contract)")
+
+        # Target 1 (50% scale-out)
+        t1 = scenarios.get("at_target_1", {})
+        if t1:
+            profit_sign = "+" if t1.get("profit_dollars", 0) >= 0 else ""
+            lines.append(
+                f"\nIf {setup.ticker} hits <code>${t1['underlying_price']:.2f}</code> → "
+                f"option ~<code>${t1['option_value']:.2f}</code> "
+                f"({t1['profit_pct']:+.0f}%, {profit_sign}<code>${t1['profit_dollars']:.0f}</code>/contract)"
+            )
+
+        # Target 2 (full exit)
+        t2 = scenarios.get("at_target_2", {})
+        if t2:
+            profit_sign = "+" if t2.get("profit_dollars", 0) >= 0 else ""
+            lines.append(
+                f"If {setup.ticker} hits <code>${t2['underlying_price']:.2f}</code> → "
+                f"option ~<code>${t2['option_value']:.2f}</code> "
+                f"({t2['profit_pct']:+.0f}%, {profit_sign}<code>${t2['profit_dollars']:.0f}</code>/contract)"
+            )
+
+        # Stop
+        st = scenarios.get("at_stop", {})
+        if st:
+            lines.append(
+                f"Stop: {setup.ticker} {'below' if 'call' in setup.option_contract.lower() else 'above'} "
+                f"<code>${st['underlying_price']:.2f}</code> → "
+                f"option ~<code>${st['option_value']:.2f}</code> ({st['loss_pct']:+.0f}%)"
+            )
+
+        # Time decay
+        td = scenarios.get("time_decay", {})
+        hr_cost = abs(td.get("1hr", 0)) if td else 0
+        if hr_cost > 0.01:
+            lines.append(f"\nTime decay: ~<code>${hr_cost:.2f}</code>/hr per contract")
+
+        # IV crush warning
+        iv_crush = scenarios.get("iv_crush_5pct", 0)
+        if iv_crush < -10:
+            lines.append(f"IV crush risk: <code>${abs(iv_crush):.0f}</code>/contract if vol drops 5%")
+
+        # Gamma warning
+        if scenarios.get("gamma_warning"):
+            lines.append("⚡ Gamma zone — moves fast both ways, size small")
+
+    else:
+        # Fallback: use greeks-based estimate (legacy)
+        greeks = setup.greeks or {}
+        cost = greeks.get("cost_per_contract", 0)
+        est_profit = greeks.get("expected_profit", 0)
+        est_pct = greeks.get("expected_pct", 0)
+
+        if cost > 0 and est_profit > 0:
+            lines.append(f"Option: ~<code>${cost:.2f}</code> → ~<code>${cost + est_profit:.2f}</code> (+{est_pct:.0f}%)")
+        if cost > 0:
+            lines.append(f"Cost: <code>${cost * 100:.0f}</code> per contract")
+        lines.append(f"Exit if stock moves past <code>${setup.stop_price:.2f}</code>")
+
+    # IV Rank + Spread summary
+    meta_parts = []
+    if iv_rank > 0:
+        iv_label = "cheap" if iv_rank < 30 else "fair" if iv_rank < 60 else "expensive"
+        meta_parts.append(f"IV Rank: {iv_rank:.0f}% ({iv_label})")
+    if spread_pct > 0:
+        spread_label = "tight" if spread_pct < 0.05 else "okay" if spread_pct < 0.10 else "wide"
+        meta_parts.append(f"Spread: {spread_pct:.1%} ({spread_label})")
+    if meta_parts:
+        lines.append(f"\n{' | '.join(meta_parts)}")
+
+    # Urgency
+    if setup.urgency == "NOW":
+        lines.append(f"\n<b>ACT NOW</b> — momentum igniting")
+    elif setup.urgency == "FADING":
+        lines.append(f"\n<i>Momentum fading — be quick or skip</i>")
+
+    return "\n".join(lines)
+
+
+def _dispatch_scalp_alerts(setups: list) -> None:
+    """Send scalp alerts to Telegram with screenshots."""
+    remaining = _check_daily_cap("scalps")
+    if remaining <= 0:
+        return
+
+    for setup in setups[:remaining]:
+        # Check cooldown
+        try:
+            from signals.notification_config import should_notify
+            if not should_notify("HIGH", setup.ticker):
+                continue
+        except Exception:
+            pass
+
+        # Format alert
+        if setup.option_contract:
+            msg = _format_options_scalp(setup)
+        else:
+            msg = _format_scalp_entry(setup)
+
+        send_telegram(f"{_header()}\n\n{msg}")
+
+        # Send TV screenshot if available
+        if setup.screenshot_png:
+            send_telegram_photo(
+                setup.screenshot_png,
+                caption=f"SCALP — {setup.ticker} {setup.setup_type.replace('_', ' ').title()}"
+            )
+
+        log.info("Sent scalp alert: %s %s", setup.ticker, setup.setup_type)
+
+    _daily_alert_count.setdefault("scalps", {"date": None, "count": 0})
+    _daily_alert_count["scalps"]["count"] += len(setups)
 
 
 # ─────────────────────────────────────────────────────────────

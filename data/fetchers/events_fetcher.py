@@ -3,6 +3,7 @@ Event contracts / prediction market fetcher.
 Aggregates events from Polymarket (Gamma API) and Kalshi (public trade API).
 All functions degrade gracefully — return empty lists on failure.
 """
+from __future__ import annotations
 import json
 import logging
 from datetime import datetime

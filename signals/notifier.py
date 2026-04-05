@@ -39,8 +39,15 @@ def send_telegram(message: str, bot_token: str = None, chat_id: str = None) -> b
     try:
         import requests
 
-        token = bot_token or get_secret("TELEGRAM_BOT_TOKEN", "")
         cid = chat_id or get_secret("TELEGRAM_CHAT_ID", "")
+
+        # Auto-select bot token: use crypto bot when sending to crypto chat
+        if bot_token:
+            token = bot_token
+        elif chat_id and chat_id == get_secret("TELEGRAM_CRYPTO_CHAT_ID"):
+            token = get_secret("TELEGRAM_CRYPTO_BOT_TOKEN") or get_secret("TELEGRAM_BOT_TOKEN", "")
+        else:
+            token = get_secret("TELEGRAM_BOT_TOKEN", "")
 
         if not token or not cid:
             logger.debug("Telegram not configured (missing bot_token or chat_id)")
@@ -74,8 +81,13 @@ def send_telegram_photo(photo_bytes: bytes, caption: str = "", bot_token: str = 
     """Send a photo via Telegram Bot API."""
     try:
         import requests
-        token = bot_token or get_secret("TELEGRAM_BOT_TOKEN", "")
         cid = chat_id or get_secret("TELEGRAM_CHAT_ID", "")
+        if bot_token:
+            token = bot_token
+        elif chat_id and chat_id == get_secret("TELEGRAM_CRYPTO_CHAT_ID"):
+            token = get_secret("TELEGRAM_CRYPTO_BOT_TOKEN") or get_secret("TELEGRAM_BOT_TOKEN", "")
+        else:
+            token = get_secret("TELEGRAM_BOT_TOKEN", "")
         if not token or not cid:
             return False
 

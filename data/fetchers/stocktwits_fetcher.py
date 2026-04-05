@@ -2,6 +2,7 @@
 Stocktwits social sentiment fetcher — public API, no authentication required.
 Rate limit: 200 requests/hour (unauthenticated).
 """
+from __future__ import annotations
 import logging
 import ssl
 import time

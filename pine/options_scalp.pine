@@ -1,0 +1,132 @@
+//@version=5
+indicator("Options Scalp Overlay", shorttitle="ScalpOvly", overlay=true, max_lines_count=50, max_boxes_count=20, max_labels_count=50)
+
+// ── Inputs ──────────────────────────────────────────────────────
+vwap_enabled    = input.bool(true, "Show VWAP + Bands", group="VWAP")
+vwap_mult1      = input.float(1.0, "VWAP Band 1 (sigma)", group="VWAP", step=0.1)
+vwap_mult2      = input.float(2.0, "VWAP Band 2 (sigma)", group="VWAP", step=0.1)
+
+orb_enabled     = input.bool(true, "Show ORB Box", group="ORB")
+orb_start_hour  = input.int(9, "ORB Start Hour", group="ORB", minval=0, maxval=23)
+orb_start_min   = input.int(30, "ORB Start Minute", group="ORB", minval=0, maxval=59)
+orb_end_hour    = input.int(9, "ORB End Hour", group="ORB", minval=0, maxval=23)
+orb_end_min     = input.int(45, "ORB End Minute", group="ORB", minval=0, maxval=59)
+
+bb_squeeze_en   = input.bool(true, "Highlight BB Squeeze", group="Bollinger")
+bb_length       = input.int(20, "BB Length", group="Bollinger")
+bb_mult         = input.float(2.0, "BB Multiplier", group="Bollinger")
+
+rsi_div_en      = input.bool(true, "Show RSI Divergence", group="RSI")
+rsi_length      = input.int(14, "RSI Length", group="RSI")
+rsi_div_lookback= input.int(10, "Divergence Lookback", group="RSI")
+
+vol_spike_en    = input.bool(true, "Color Volume Spike Bars", group="Volume")
+vol_avg_len     = input.int(20, "Volume Average Length", group="Volume")
+vol_spike_mult  = input.float(2.0, "Spike Multiplier", group="Volume")
+
+// ── VWAP + Standard Deviation Bands ─────────────────────────────
+// Intraday VWAP resets each session
+var float cum_vol     = 0.0
+var float cum_tp_vol  = 0.0
+var float cum_tp2_vol = 0.0
+
+is_new_session = ta.change(time("D")) != 0
+
+if is_new_session
+    cum_vol     := 0.0
+    cum_tp_vol  := 0.0
+    cum_tp2_vol := 0.0
+
+tp = hlc3
+cum_vol     += nz(volume)
+cum_tp_vol  += nz(volume) * tp
+cum_tp2_vol += nz(volume) * tp * tp
+
+vwap_val  = cum_vol > 0 ? cum_tp_vol / cum_vol : tp
+variance  = cum_vol > 0 ? math.max(cum_tp2_vol / cum_vol - vwap_val * vwap_val, 0) : 0
+stdev_val = math.sqrt(variance)
+
+vwap_upper1 = vwap_val + vwap_mult1 * stdev_val
+vwap_lower1 = vwap_val - vwap_mult1 * stdev_val
+vwap_upper2 = vwap_val + vwap_mult2 * stdev_val
+vwap_lower2 = vwap_val - vwap_mult2 * stdev_val
+
+plot(vwap_enabled ? vwap_val : na, "VWAP", color=color.new(color.blue, 0), linewidth=2)
+plot(vwap_enabled ? vwap_upper1 : na, "+1\u03C3", color=color.new(color.blue, 60))
+plot(vwap_enabled ? vwap_lower1 : na, "-1\u03C3", color=color.new(color.blue, 60))
+plot(vwap_enabled ? vwap_upper2 : na, "+2\u03C3", color=color.new(color.teal, 70))
+plot(vwap_enabled ? vwap_lower2 : na, "-2\u03C3", color=color.new(color.teal, 70))
+
+// ── Opening Range Breakout Box ──────────────────────────────────
+var float orb_high = na
+var float orb_low  = na
+var box   orb_box  = na
+
+in_orb_window = (hour == orb_start_hour and minute >= orb_start_min) or
+                (hour == orb_end_hour and minute < orb_end_min) or
+                (hour > orb_start_hour and hour < orb_end_hour)
+
+if orb_enabled
+    if is_new_session
+        orb_high := na
+        orb_low  := na
+        orb_box  := na
+
+    if in_orb_window
+        orb_high := na(orb_high) ? high : math.max(orb_high, high)
+        orb_low  := na(orb_low)  ? low  : math.min(orb_low, low)
+
+    // Draw box after ORB window closes (extend right to end of day)
+    if not in_orb_window and not na(orb_high) and not na(orb_low) and na(orb_box)
+        orb_box := box.new(bar_index - 1, orb_high, bar_index + 100, orb_low,
+                           border_color=color.new(color.orange, 40),
+                           bgcolor=color.new(color.orange, 90),
+                           border_width=1, extend=extend.right)
+
+    // Update right edge
+    if not na(orb_box)
+        box.set_right(orb_box, bar_index + 1)
+
+// ── Bollinger Squeeze Highlight ─────────────────────────────────
+[bb_mid, bb_up, bb_dn] = ta.bb(close, bb_length, bb_mult)
+bb_width    = (bb_up - bb_dn) / bb_mid
+bb_width_lo = ta.lowest(bb_width, bb_length)
+is_squeeze  = bb_width <= bb_width_lo * 1.05  // within 5% of 20-bar low
+
+bgcolor(bb_squeeze_en and is_squeeze ? color.new(color.purple, 88) : na, title="BB Squeeze Zone")
+
+// ── RSI Divergence ──────────────────────────────────────────────
+rsi_val = ta.rsi(close, rsi_length)
+
+// Bearish divergence: price makes higher high, RSI makes lower high
+price_hh = high > ta.highest(high[1], rsi_div_lookback)
+rsi_lh   = rsi_val < ta.highest(rsi_val[1], rsi_div_lookback)
+bearish_div = rsi_div_en and price_hh and rsi_lh and rsi_val > 65
+
+// Bullish divergence: price makes lower low, RSI makes higher low
+price_ll = low < ta.lowest(low[1], rsi_div_lookback)
+rsi_hl   = rsi_val > ta.lowest(rsi_val[1], rsi_div_lookback)
+bullish_div = rsi_div_en and price_ll and rsi_hl and rsi_val < 35
+
+plotshape(bearish_div, "Bear Div", shape.triangledown, location.abovebar, color.new(color.red, 20), size=size.small)
+plotshape(bullish_div, "Bull Div", shape.triangleup, location.belowbar, color.new(color.green, 20), size=size.small)
+
+// ── Volume Spike Bars ───────────────────────────────────────────
+vol_avg    = ta.sma(volume, vol_avg_len)
+is_vol_spike = volume > vol_avg * vol_spike_mult
+
+barcolor(vol_spike_en and is_vol_spike and close > open ? color.new(color.lime, 0) : na, title="Vol Spike Up")
+barcolor(vol_spike_en and is_vol_spike and close <= open ? color.new(color.fuchsia, 0) : na, title="Vol Spike Down")
+
+// ── Info Table ──────────────────────────────────────────────────
+var table info = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 80))
+if barstate.islast
+    table.cell(info, 0, 0, "VWAP", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 0, str.tostring(vwap_val, "#.##"), text_color=color.blue, text_size=size.small)
+    table.cell(info, 0, 1, "RSI", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 1, str.tostring(rsi_val, "#.#"), text_color=rsi_val > 70 ? color.red : rsi_val < 30 ? color.green : color.white, text_size=size.small)
+    table.cell(info, 0, 2, "BB Width", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 2, str.tostring(bb_width * 100, "#.##") + "%", text_color=is_squeeze ? color.purple : color.white, text_size=size.small)
+    table.cell(info, 0, 3, "Vol Ratio", text_color=color.white, text_size=size.small)
+    vol_ratio = vol_avg > 0 ? volume / vol_avg : 0
+    table.cell(info, 1, 3, str.tostring(vol_ratio, "#.#") + "x", text_color=is_vol_spike ? color.lime : color.white, text_size=size.small)

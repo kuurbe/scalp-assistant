@@ -2,7 +2,7 @@
 Commodities page — precious metals, oil, agriculture, uranium.
 """
 import streamlit as st
-from dashboard.theme import COLORS
+from dashboard.theme import COLORS, CARD_CSS
 from dashboard.components.metric_card import metric_card
 from dashboard.components.leaderboard import render_leaderboard
 from dashboard.components.ticker_card import ticker_card
@@ -21,12 +21,35 @@ def render():
     </div>
     """, unsafe_allow_html=True)
 
-    with st.spinner("Scanning commodity universe..."):
-        commodities = data_bridge.scan_universe("commodities")
+    # Non-blocking — use session state cache
+    cache_key = "commodities_scan_results"
+    commodities = st.session_state.get(cache_key, [])
 
     if not commodities:
-        st.info("No commodity scan data yet. The scanner will populate shortly.")
+        st.markdown(f"""
+        <div style="{CARD_CSS} text-align:center; padding:40px;">
+            <div style="font-size:16px; font-weight:500; color:{COLORS['text']}; margin-bottom:8px;">
+                {"Ready to scan commodities" if is_simple else "Commodity Scanner Ready"}</div>
+            <div style="font-size:14px; color:{COLORS['text_secondary']};">
+                {"Click below to scan metals, energy, and agriculture" if is_simple else "Analyze 15 commodity ETFs across all sectors"}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Scan Commodities" if not is_simple else "Find Best Commodities", type="primary"):
+            with st.spinner("Scanning commodity universe..."):
+                commodities = data_bridge.scan_universe("commodities")
+                st.session_state[cache_key] = commodities
+            st.rerun()
         return
+
+    # Refresh button
+    col_btn, _ = st.columns([1, 4])
+    with col_btn:
+        if st.button("Refresh Scan", type="secondary", key="commodities_refresh"):
+            data_bridge.scan_universe.clear()
+            with st.spinner("Scanning commodities..."):
+                commodities = data_bridge.scan_universe("commodities")
+                st.session_state[cache_key] = commodities
+            st.rerun()
 
     active = [c for c in commodities if c.composite_score >= 40]
 

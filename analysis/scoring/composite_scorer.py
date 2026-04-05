@@ -61,6 +61,39 @@ class ScoredTicker:
     nearest_resistance: float = 0
     # Asset class
     asset_class: str = "stocks"
+    # Sefirot behavioral
+    sefirot_balance: float = 0
+    sefirot_equilibrium: float = 0
+    sefirot_phase_alignment: float = 0
+    hod_technical_clarity: float = 0
+    netzach_persistence: float = 0
+    sefirot_dominant_pillar: str = ""
+    sefirot_narrative: str = ""
+    sefirot_score: float = 0
+    # Quant formula signals (Six-Formula Engine)
+    kelly_fraction: float = 0.0
+    ev_gap: float = 0.0
+    kl_divergence: float = 0.0
+    bayesian_posterior: float = 0.5
+    stoikov_reservation: float = 0.0
+    lmsr_mispricing: float = 0.0
+    quant_score: float = 0.0
+    quant_aligned: bool = False
+    quant_n_agreeing: int = 0
+    # Whale detection
+    whale_score: float = 0.0
+    whale_volume_sigma: float = 0.0
+    whale_sweep_detected: bool = False
+    whale_golden_sweep: bool = False
+    # ML prediction data (for predictions page)
+    predicted_return: float = 0.0
+    bull_prob: float = 0.5
+    ml_confidence: float = 0.0
+    forecast_10d: list = field(default_factory=list)
+    # Crypto-specific
+    btc_correlation_20d: float = 0.0
+    # TradingView confirmation
+    tv_confirmation: float = 0.0
     # Timestamps
     scan_time: str = ""
 
@@ -82,6 +115,7 @@ def score_ticker(
     catalyst_info: dict = None,
     sentiment_info: dict = None,
     social_info: dict = None,
+    sefirot_info: dict = None,
     asset_class: str = "stocks",
 ) -> ScoredTicker:
     """
@@ -176,6 +210,14 @@ def score_ticker(
         nearest_support=levels_data.get("nearest_support", 0) if levels_data else 0,
         nearest_resistance=levels_data.get("nearest_resistance", 0) if levels_data else 0,
         asset_class=asset_class,
+        sefirot_balance=sefirot_info.get("balance", 0) if sefirot_info else 0,
+        sefirot_equilibrium=sefirot_info.get("equilibrium", 0) if sefirot_info else 0,
+        sefirot_phase_alignment=sefirot_info.get("phase_alignment", 0) if sefirot_info else 0,
+        hod_technical_clarity=sefirot_info.get("hod_clarity", 0) if sefirot_info else 0,
+        netzach_persistence=sefirot_info.get("netzach", 0) if sefirot_info else 0,
+        sefirot_dominant_pillar=sefirot_info.get("dominant_pillar", "") if sefirot_info else "",
+        sefirot_narrative=sefirot_info.get("narrative", "") if sefirot_info else "",
+        sefirot_score=sefirot_info.get("score", 0) if sefirot_info else 0,
         scan_time=datetime.datetime.now().strftime("%I:%M %p"),
     )
 

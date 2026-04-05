@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tradingview": {
+      "command": "/usr/local/bin/node",
+      "args": ["/Users/jacolby/tradingview-mcp/src/server.js"]
+    }
+  }
+}

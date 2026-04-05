@@ -4,6 +4,7 @@ Candlestick pattern recognition using pure numpy/pandas.
 Detects common single-bar and multi-bar reversal and continuation
 patterns without any TA-Lib dependency.
 """
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd

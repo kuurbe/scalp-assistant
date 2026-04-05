@@ -2,6 +2,7 @@
 Achievement system for Scalp Assistant — gamified prediction tracking.
 Defines achievements, checks earned status, persists to disk.
 """
+from __future__ import annotations
 import os
 import json
 import logging

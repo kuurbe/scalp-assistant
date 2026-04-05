@@ -3,6 +3,7 @@ Tracks influential content creators, fintwit personalities, and political figure
 whose statements move markets. Since we cannot directly access X/Twitter for free,
 we track these influencers through news coverage of their statements.
 """
+from __future__ import annotations
 import re
 from data.cache import cached
 

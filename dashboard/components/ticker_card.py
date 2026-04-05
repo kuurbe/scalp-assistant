@@ -163,7 +163,7 @@ def ticker_card(pick, rank: int = 0, show_details: bool = True):
                     details_html += _detail_row("Catalyst", clean_cat)
 
             # Support / Resistance as badges
-            if pick.nearest_support > 0:
+            if (pick.nearest_support or 0) > 0:
                 levels_html = (
                     _level_badge("Support", pick.nearest_support, COLORS["success"])
                     + _level_badge("Resistance", pick.nearest_resistance, COLORS["danger"])

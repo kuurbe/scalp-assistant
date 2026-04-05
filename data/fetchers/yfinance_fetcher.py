@@ -2,6 +2,7 @@
 yfinance data fetcher — OHLCV, options, ticker info, pre-market.
 Uses the yfinance library for all Yahoo Finance data.
 """
+from __future__ import annotations
 import logging
 import pandas as pd
 import yfinance as yf

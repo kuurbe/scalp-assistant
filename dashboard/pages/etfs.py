@@ -2,7 +2,7 @@
 ETFs page — sector rotation, thematic, fixed income, leveraged.
 """
 import streamlit as st
-from dashboard.theme import COLORS
+from dashboard.theme import COLORS, CARD_CSS
 from dashboard.components.metric_card import metric_card
 from dashboard.components.leaderboard import render_leaderboard
 from dashboard.components.ticker_card import ticker_card
@@ -21,12 +21,35 @@ def render():
     </div>
     """, unsafe_allow_html=True)
 
-    with st.spinner("Scanning ETF universe..."):
-        etfs = data_bridge.scan_universe("etfs")
+    # Non-blocking — use session state cache
+    cache_key = "etfs_scan_results"
+    etfs = st.session_state.get(cache_key, [])
 
     if not etfs:
-        st.info("No ETF scan data yet. The scanner will populate shortly.")
+        st.markdown(f"""
+        <div style="{CARD_CSS} text-align:center; padding:40px;">
+            <div style="font-size:16px; font-weight:500; color:{COLORS['text']}; margin-bottom:8px;">
+                {"Ready to scan ETF markets" if is_simple else "ETF Scanner Ready"}</div>
+            <div style="font-size:14px; color:{COLORS['text_secondary']};">
+                {"Click below to scan ETFs across all sectors" if is_simple else "Analyze sector, thematic, fixed income, and leveraged ETFs"}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Scan ETFs" if not is_simple else "Find Best ETFs", type="primary"):
+            with st.spinner("Scanning ETF universe..."):
+                etfs = data_bridge.scan_universe("etfs")
+                st.session_state[cache_key] = etfs
+            st.rerun()
         return
+
+    # Refresh button
+    col_btn, _ = st.columns([1, 4])
+    with col_btn:
+        if st.button("Refresh Scan", type="secondary", key="etfs_refresh"):
+            data_bridge.scan_universe.clear()
+            with st.spinner("Scanning ETFs..."):
+                etfs = data_bridge.scan_universe("etfs")
+                st.session_state[cache_key] = etfs
+            st.rerun()
 
     active = [e for e in etfs if e.composite_score >= 40]
 

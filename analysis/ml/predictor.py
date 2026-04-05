@@ -11,6 +11,7 @@ Key improvements over v1:
 
 import os
 import json
+import threading
 import numpy as np
 import pandas as pd
 import joblib
@@ -19,6 +20,10 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 
 from analysis.ml.feature_engine import build_features, FEATURE_COLS, build_forecast
+from config import settings
+
+import logging
+logger = logging.getLogger(__name__)
 
 # Model storage directory
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "models")
@@ -26,6 +31,44 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Prediction history for drift detection
 _PRED_HISTORY_FILE = os.path.join(MODEL_DIR, "pred_history.json")
+
+# Thread lock for pred_history.json writes (prevents file corruption from concurrent threads)
+_PRED_HISTORY_LOCK = threading.Lock()
+
+# ── Model cache (load once, reuse across all tickers) ──
+_MODEL_CACHE = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_models(model_name: str = "universal"):
+    """Load models/scaler once and cache in memory. Thread-safe."""
+    if model_name in _MODEL_CACHE:
+        return _MODEL_CACHE[model_name]
+
+    with _MODEL_CACHE_LOCK:
+        # Double-check after acquiring lock
+        if model_name in _MODEL_CACHE:
+            return _MODEL_CACHE[model_name]
+
+        reg_file = _model_path(model_name, "reg")
+        clf_file = _model_path(model_name, "clf")
+        scaler_file = _scaler_path(model_name)
+
+        if not os.path.exists(reg_file):
+            reg_file = _model_path("universal", "reg")
+            clf_file = _model_path("universal", "clf")
+            scaler_file = _scaler_path("universal")
+
+        if not os.path.exists(reg_file):
+            return None
+
+        models = {
+            "reg": joblib.load(reg_file),
+            "clf": joblib.load(clf_file),
+            "scaler": joblib.load(scaler_file),
+        }
+        _MODEL_CACHE[model_name] = models
+        return models
 
 
 def _model_path(ticker: str = "universal", kind: str = "reg") -> str:
@@ -100,8 +143,8 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
         y_dir_train, y_dir_test = y_dir[train_idx], y_dir[test_idx]
 
         reg = GradientBoostingRegressor(
-            n_estimators=120, learning_rate=0.03, max_depth=2,
-            subsample=0.7, min_samples_leaf=25, random_state=42,
+            n_estimators=100, learning_rate=0.02, max_depth=2,
+            subsample=0.6, min_samples_leaf=40, random_state=42,
         )
         reg.fit(X_train, y_ret_train)
 
@@ -109,8 +152,8 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
         r2_test = reg.score(X_test, y_ret_test)
 
         clf = GradientBoostingClassifier(
-            n_estimators=120, learning_rate=0.03, max_depth=2,
-            subsample=0.7, min_samples_leaf=25, random_state=42,
+            n_estimators=100, learning_rate=0.02, max_depth=2,
+            subsample=0.6, min_samples_leaf=40, random_state=42,
         )
         clf.fit(X_train, y_dir_train)
 
@@ -170,18 +213,23 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
         warnings.append(f"Severely negative R²={wf_r2:.3f} — model is harmful")
 
     # ── Train final model on ALL data ──
+    # Tighter regularization than walk-forward folds to reduce overfitting:
+    # - max_depth=2 (shallow trees force generalization)
+    # - min_samples_leaf=30 (prevents memorizing small groups)
+    # - n_estimators=150 (fewer trees = less overfitting)
+    # - subsample=0.7 (more stochastic = better generalization)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
     reg_model = GradientBoostingRegressor(
-        n_estimators=200, learning_rate=0.05, max_depth=3,
-        subsample=0.8, min_samples_leaf=10, random_state=42,
+        n_estimators=150, learning_rate=0.03, max_depth=2,
+        subsample=0.7, min_samples_leaf=30, random_state=42,
     )
     reg_model.fit(X_scaled, y_ret)
 
     clf_model = GradientBoostingClassifier(
-        n_estimators=200, learning_rate=0.05, max_depth=3,
-        subsample=0.8, min_samples_leaf=10, random_state=42,
+        n_estimators=150, learning_rate=0.03, max_depth=2,
+        subsample=0.7, min_samples_leaf=30, random_state=42,
     )
     clf_model.fit(X_scaled, y_dir)
 
@@ -228,28 +276,91 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
     }
 
 
+# ── TV LIVE BLENDING ────────────────────────────────────────────────────────
+
+# Mapping from TradingView indicator keys → feature column names
+_TV_TO_FEATURE_MAP = {
+    "RSI": "rsi_14",
+    "Relative Strength Index": "rsi_14",
+    "Stoch %K": "stoch_k",
+    "Stochastic": "stoch_k",
+    "%K": "stoch_k",
+}
+
+
+def _blend_tv_features(latest_row: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Blend live TradingView indicator values into computed features.
+
+    Weighted average: TV_BLEND_WEIGHT * tv_value + (1 - weight) * computed_value.
+    Falls back to computed values if TV unavailable or any error occurs.
+    """
+    try:
+        if not getattr(settings, "ML_TV_BLEND_ENABLED", False):
+            return latest_row
+
+        from signals.tradingview_bridge import is_tv_available, get_tv_indicators
+        if not is_tv_available():
+            return latest_row
+
+        tv_vals = get_tv_indicators(ticker)
+        if not tv_vals:
+            return latest_row
+
+        weight = getattr(settings, "ML_TV_BLEND_WEIGHT", 0.7)
+        blended = latest_row.copy()
+
+        # Direct replacement features (TV value matches feature semantics)
+        for tv_key, feat_col in _TV_TO_FEATURE_MAP.items():
+            if tv_key in tv_vals and feat_col in blended.columns:
+                tv_val = float(tv_vals[tv_key])
+                computed = float(blended[feat_col].iloc[0])
+                blended[feat_col] = weight * tv_val + (1 - weight) * computed
+
+        # MACD histogram — needs ATR normalization
+        hist_key = next((k for k in ("Histogram", "MACD-hist", "Hist") if k in tv_vals), None)
+        if hist_key and "macd_hist_norm" in blended.columns:
+            atr = float(blended.get("atr_14", pd.Series(1.0)).iloc[0])
+            if atr > 0:
+                tv_hist_norm = float(tv_vals[hist_key]) / atr
+                computed = float(blended["macd_hist_norm"].iloc[0])
+                blended["macd_hist_norm"] = weight * tv_hist_norm + (1 - weight) * computed
+
+        return blended
+
+    except Exception:
+        return latest_row
+
+
 # ── PREDICTION ───────────────────────────────────────────────────────────────
 
-def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "universal") -> dict:
-    """Generate ML prediction with drift detection and Sharpe-adjusted scoring."""
+def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "universal",
+                   featured_df: pd.DataFrame = None, use_tv: bool = False) -> dict:
+    """Generate ML prediction with drift detection and Sharpe-adjusted scoring.
+
+    Args:
+        use_tv: If True, blend live TradingView values into features before prediction.
+                Only use for top-N picks (adds ~1-2s latency per call).
+    """
     try:
-        # Load models
-        reg_file = _model_path(model_name, "reg")
-        clf_file = _model_path(model_name, "clf")
-        scaler_file = _scaler_path(model_name)
-
-        # Fallback to universal
-        if not os.path.exists(reg_file):
-            reg_file = _model_path("universal", "reg")
-            clf_file = _model_path("universal", "clf")
-            scaler_file = _scaler_path("universal")
-
-        if not os.path.exists(reg_file):
+        # Load models (cached — single load for all tickers)
+        cached = _get_cached_models(model_name)
+        if cached is None:
             return _empty_prediction()
 
-        reg_model = joblib.load(reg_file)
-        clf_model = joblib.load(clf_file)
-        scaler = joblib.load(scaler_file)
+        reg_model = cached["reg"]
+        clf_model = cached["clf"]
+        scaler = cached["scaler"]
+
+        # Feature version check — prevent crash if model was trained with different features
+        meta = _get_cached_meta(model_name)
+        model_n_features = meta.get("n_features", 0)
+        if model_n_features and model_n_features != len(FEATURE_COLS):
+            logger.warning(
+                "Feature mismatch: model expects %d features, code has %d. "
+                "Run auto_retrain to update the model.",
+                model_n_features, len(FEATURE_COLS),
+            )
+            return _empty_prediction()
 
         # Get data if not provided
         if df is None:
@@ -260,12 +371,16 @@ def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "univ
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-        # Build features
-        featured = build_features(df)
+        # Build features (reuse pre-built if provided)
+        featured = featured_df if featured_df is not None else build_features(df)
         latest = featured[FEATURE_COLS].iloc[-1:]
 
         if latest.isna().any(axis=1).iloc[0]:
             return _empty_prediction()
+
+        # Optionally blend live TV values
+        if use_tv:
+            latest = _blend_tv_features(latest, ticker)
 
         # Predict
         X = scaler.transform(latest.values)
@@ -321,6 +436,32 @@ def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "univ
         return _empty_prediction()
 
 
+# ── Meta cache (read JSON once per model, not per ticker) ──
+_META_CACHE = {}
+_META_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_meta(model_name: str) -> dict:
+    """Load model metadata once and cache."""
+    if model_name in _META_CACHE:
+        return _META_CACHE[model_name]
+    with _META_CACHE_LOCK:
+        if model_name in _META_CACHE:
+            return _META_CACHE[model_name]
+        meta_file = _meta_path(model_name)
+        if not os.path.exists(meta_file):
+            meta_file = _meta_path("universal")
+        meta = {}
+        if os.path.exists(meta_file):
+            try:
+                with open(meta_file) as f:
+                    meta = json.load(f)
+            except Exception:
+                pass
+        _META_CACHE[model_name] = meta
+        return meta
+
+
 def _sharpe_adjusted_score(bull_prob: float, predicted_return: float, model_name: str) -> float:
     """ML score that penalizes noisy/low-Sharpe models.
 
@@ -331,56 +472,37 @@ def _sharpe_adjusted_score(bull_prob: float, predicted_return: float, model_name
     reg_score = float(np.clip(50 + predicted_return * 25, 0, 100))
     raw_score = 0.6 * clf_score + 0.4 * reg_score
 
-    # Load model quality metadata
-    meta_file = _meta_path(model_name)
-    if not os.path.exists(meta_file):
-        meta_file = _meta_path("universal")
-
+    meta = _get_cached_meta(model_name)
     quality_factor = 1.0
-    if os.path.exists(meta_file):
-        try:
-            with open(meta_file) as f:
-                meta = json.load(f)
-            sharpe = meta.get("sharpe", 0)
-            wf_hit = meta.get("wf_hit_rate", 50)
-            dummy = meta.get("dummy_baseline", 50)
+    if meta:
+        sharpe = meta.get("sharpe", 0)
+        wf_hit = meta.get("wf_hit_rate", 50)
+        dummy = meta.get("dummy_baseline", 50)
 
-            # Penalize if model is barely better than dummy
-            edge = max(wf_hit - dummy, 0)
-            quality_factor = np.clip(0.5 + edge / 20, 0.5, 1.0)
+        edge = max(wf_hit - dummy, 0)
+        quality_factor = np.clip(0.5 + edge / 20, 0.5, 1.0)
 
-            # Additional penalty for negative Sharpe
-            if sharpe < 0:
-                quality_factor *= 0.8
-        except Exception:
-            pass
+        if sharpe < 0:
+            quality_factor *= 0.8
 
-    # Pull score toward 50 (neutral) based on quality
     adjusted = 50 + (raw_score - 50) * quality_factor
     return float(np.clip(adjusted, 0, 100))
 
 
 def _check_drift(predicted_return: float, model_name: str) -> str:
     """Detect prediction drift via KS-test against training distribution."""
-    meta_file = _meta_path(model_name)
-    if not os.path.exists(meta_file):
-        meta_file = _meta_path("universal")
-    if not os.path.exists(meta_file):
+    meta = _get_cached_meta(model_name)
+    if not meta:
         return ""
 
     try:
-        with open(meta_file) as f:
-            meta = json.load(f)
-
         train_mean = meta.get("pred_mean", 0)
         train_std = meta.get("pred_std", 1)
 
-        # Check if prediction is far outside training distribution
         z = abs(predicted_return - train_mean) / (train_std + 1e-8)
         if z > 3.0:
             return f"Prediction {predicted_return:.2f}% is {z:.1f}σ from training mean — possible distribution shift"
 
-        # Check recent prediction history for systematic drift
         history = _load_pred_history(model_name)
         if len(history) >= 10:
             recent_mean = np.mean(history[-10:])
@@ -392,23 +514,43 @@ def _check_drift(predicted_return: float, model_name: str) -> str:
     return ""
 
 
+# In-memory buffer for prediction logging (flush once after scan, not per-ticker)
+_PRED_LOG_BUFFER = []
+_PRED_LOG_BUFFER_LOCK = threading.Lock()
+
+
 def _log_prediction(predicted_return: float, model_name: str):
-    """Append prediction to history for drift monitoring."""
+    """Buffer prediction in memory. Call flush_pred_history() after scan completes."""
     try:
-        history = {}
-        if os.path.exists(_PRED_HISTORY_FILE):
-            with open(_PRED_HISTORY_FILE) as f:
-                history = json.load(f)
+        with _PRED_LOG_BUFFER_LOCK:
+            _PRED_LOG_BUFFER.append((model_name, round(predicted_return, 4)))
+    except Exception:
+        pass
 
-        key = model_name
-        if key not in history:
-            history[key] = []
-        history[key].append(round(predicted_return, 4))
-        # Keep last 100 predictions
-        history[key] = history[key][-100:]
 
-        with open(_PRED_HISTORY_FILE, "w") as f:
-            json.dump(history, f)
+def flush_pred_history():
+    """Write all buffered predictions to disk in one batch. Call after scan completes."""
+    try:
+        with _PRED_LOG_BUFFER_LOCK:
+            if not _PRED_LOG_BUFFER:
+                return
+            to_write = list(_PRED_LOG_BUFFER)
+            _PRED_LOG_BUFFER.clear()
+
+        with _PRED_HISTORY_LOCK:
+            history = {}
+            if os.path.exists(_PRED_HISTORY_FILE):
+                with open(_PRED_HISTORY_FILE) as f:
+                    history = json.load(f)
+
+            for model_name, pred_val in to_write:
+                if model_name not in history:
+                    history[model_name] = []
+                history[model_name].append(pred_val)
+                history[model_name] = history[model_name][-100:]
+
+            with open(_PRED_HISTORY_FILE, "w") as f:
+                json.dump(history, f)
     except Exception:
         pass
 
@@ -425,10 +567,10 @@ def _load_pred_history(model_name: str) -> list:
     return []
 
 
-def get_ml_score(ticker: str, df: pd.DataFrame = None) -> float:
+def get_ml_score(ticker: str, df: pd.DataFrame = None, featured_df: pd.DataFrame = None) -> float:
     """Return a 0-100 ML prediction score for composite scorer integration."""
     try:
-        result = predict_ticker(ticker, df=df)
+        result = predict_ticker(ticker, df=df, featured_df=featured_df)
         return result.get("ml_score", 50.0)
     except Exception:
         return 50.0

@@ -81,7 +81,8 @@ with st.sidebar:
             "Commodities",
             "Macro",
             "Events",
-            "ML Predictions",
+            "Predictions",
+            "Sefirot",
             "Alerts",
         ],
         label_visibility="collapsed",
@@ -141,7 +142,8 @@ page_map = {
     "Commodities": "dashboard.pages.commodities",
     "Macro": "dashboard.pages.macro",
     "Events": "dashboard.pages.events",
-    "ML Predictions": "dashboard.pages.ml_predictions",
+    "Predictions": "dashboard.pages.ml_predictions",
+    "Sefirot": "dashboard.pages.sefirot",
     "Alerts": "dashboard.pages.alerts",
 }
 

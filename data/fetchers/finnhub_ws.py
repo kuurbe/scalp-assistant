@@ -2,6 +2,7 @@
 Finnhub WebSocket for real-time trade data.
 Runs in a background daemon thread during live mode.
 """
+from __future__ import annotations
 import json
 import time
 import logging

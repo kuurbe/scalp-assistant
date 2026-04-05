@@ -3,6 +3,7 @@ Chart generator for Telegram alerts — creates clean mini price charts
 with entry/stop/target levels and energy overlay.
 Supports line charts and OHLCV candlestick charts via mplfinance.
 """
+from __future__ import annotations
 import io
 import logging
 import numpy as np

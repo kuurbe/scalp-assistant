@@ -292,6 +292,21 @@ def _heuristic_confidence(scored_ticker) -> float:
         except Exception:
             pass
 
+        # Sefirot behavioral alignment (0-10 pts)
+        cg_balance = abs(getattr(scored_ticker, "sefirot_balance", 0))
+        equilibrium = getattr(scored_ticker, "sefirot_equilibrium", 0)
+        hod_clarity = getattr(scored_ticker, "hod_technical_clarity", 0)
+
+        if cg_balance > 0.5 and equilibrium < 0.3:
+            # Strong directional conviction + low equilibrium = move underway
+            confidence += 8
+        elif cg_balance > 0.3 and hod_clarity > 0.5:
+            # Moderate conviction with clear signals
+            confidence += 4
+        elif equilibrium > 0.7:
+            # Too balanced, no edge
+            confidence -= 3
+
         return float(np.clip(confidence, 0, 100))
 
     except Exception:

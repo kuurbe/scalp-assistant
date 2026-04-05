@@ -2,6 +2,7 @@
 Finnhub data fetcher — news, sentiment, earnings, financials.
 Uses the Finnhub REST API with token-bucket rate limiting.
 """
+from __future__ import annotations
 import logging
 import os
 import time

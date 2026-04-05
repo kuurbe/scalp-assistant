@@ -2,6 +2,7 @@
 Insider & congressional trading fetcher.
 Uses existing Finnhub API key for insider transactions.
 """
+from __future__ import annotations
 import os
 import logging
 import requests

@@ -1,6 +1,7 @@
 """
 CSV-based performance logging and win rate tracking.
 """
+from __future__ import annotations
 import os
 import datetime
 import logging

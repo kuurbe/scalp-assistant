@@ -308,24 +308,250 @@ def compute_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
 _MOMENTUM_COLS = ["ret_5d", "ret_20d", "z_score_20"]
 
 
-# ── 7. MASTER FEATURE BUILDER ────────────────────────────────────────────
+# ── 7. TV-EQUIVALENT TECHNICAL FEATURES ─────────────────────────────────
 
-# Final feature list — Saty-framework aligned
+def compute_tv_technical_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Technical indicators matching TradingView defaults.
+
+    RSI, MACD, Bollinger Bands, Stochastic, ADX — computed from OHLCV
+    so they work for historical training (730 days) and match live TV values.
+    At prediction time, live TV values can optionally replace these.
+    """
+    out = df.copy()
+    close = out["Close"].astype(float)
+    high = out["High"].astype(float)
+    low = out["Low"].astype(float)
+    n = len(close)
+
+    if n < 30:
+        for col in _TV_TECH_COLS:
+            out[col] = 0.0
+        return out
+
+    atr = out.get("atr_14", pd.Series(1.0, index=out.index))
+    safe_atr = atr.replace(0, np.nan)
+
+    # ── RSI(14) — Wilder's smoothing (matches TradingView) ──
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi = (100 - 100 / (1 + rs)).fillna(50)
+    out["rsi_14"] = rsi
+
+    # ── RSI Rate of Change (3-bar) — acceleration ──
+    out["rsi_roc_3"] = rsi.diff(3).fillna(0)
+
+    # ── MACD Histogram (ATR-normalized) ──
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    macd_hist = macd_line - signal_line
+    out["macd_hist_norm"] = (macd_hist / safe_atr).fillna(0)
+
+    # ── MACD Histogram Slope (3-bar, ATR-normalized) ──
+    out["macd_hist_slope"] = (macd_hist.diff(3) / safe_atr).fillna(0)
+
+    # ── Bollinger Band %B — mean-reversion position ──
+    sma20 = close.rolling(20, min_periods=10).mean()
+    std20 = close.rolling(20, min_periods=10).std()
+    bb_upper = sma20 + 2 * std20
+    bb_lower = sma20 - 2 * std20
+    bb_range = (bb_upper - bb_lower).replace(0, np.nan)
+    out["bb_pct_b"] = ((close - bb_lower) / bb_range).fillna(0.5)
+
+    # ── Bollinger Band Width — volatility squeeze ──
+    out["bb_width"] = (bb_range / sma20.replace(0, np.nan)).fillna(0)
+
+    # ── Stochastic %K(14,3) ──
+    low14 = low.rolling(14, min_periods=5).min()
+    high14 = high.rolling(14, min_periods=5).max()
+    stoch_range = (high14 - low14).replace(0, np.nan)
+    raw_k = 100 * (close - low14) / stoch_range
+    out["stoch_k"] = raw_k.rolling(3, min_periods=1).mean().fillna(50)
+
+    # ── ADX(14) — trend strength ──
+    plus_dm = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    # Zero out when the other is larger
+    plus_dm = plus_dm.where(plus_dm > minus_dm, 0)
+    minus_dm = minus_dm.where(minus_dm > plus_dm, 0)
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+
+    atr14 = tr.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
+    safe_atr14 = atr14.replace(0, np.nan)
+
+    plus_di = 100 * plus_dm.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean() / safe_atr14
+    minus_di = 100 * minus_dm.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean() / safe_atr14
+
+    di_sum = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+    out["adx_14"] = dx.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean().fillna(0)
+
+    return out
+
+
+_TV_TECH_COLS = [
+    "rsi_14", "rsi_roc_3", "macd_hist_norm", "macd_hist_slope",
+    "bb_pct_b", "bb_width", "stoch_k", "adx_14",
+]
+
+
+# ── 8. SEFIROT BEHAVIORAL FEATURES ────���───────────────────────────���──────
+
+def compute_sefirot_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Kabbalistic behavioral finance features — Tree of Life mapped to
+    crowd psychology dynamics.
+
+    All features derived from existing OHLCV data (no new data sources).
+    Maps Sefirot (divine emanations) to quantifiable market states:
+      - Chesed/Gevurah: expansion vs contraction pressure
+      - Tiferet: market equilibrium / emotional balance
+      - Netzach: trend persistence / conviction
+      - Hod: technical signal clarity / agreement
+      - Fibonacci-gematria: price proximity to shared Fibonacci/Kabbalistic nodes
+    """
+    out = df.copy()
+    close = out["Close"].astype(float)
+    n = len(close)
+
+    if n < 30:
+        for col in _SEFIROT_COLS:
+            out[col] = 0.0
+        return out
+
+    # --- Dependencies (should already be computed) ---
+    atr = out.get("atr_14", pd.Series(0.0, index=out.index))
+    safe_atr = atr.replace(0, np.nan)
+    buy_pct = out.get("buy_volume_pct", pd.Series(0.5, index=out.index))
+    sell_pct = out.get("sell_volume_pct", pd.Series(0.5, index=out.index))
+    rel_vol = out.get("rel_volume", pd.Series(1.0, index=out.index))
+    phase_osc = out.get("phase_osc", pd.Series(0.0, index=out.index))
+    phase_mom = out.get("phase_momentum", pd.Series(0.0, index=out.index))
+    phase_comp = out.get("phase_compression", pd.Series(1.0, index=out.index))
+    vol_bias = out.get("volume_bias", pd.Series(0.0, index=out.index))
+    ema_8_13 = out.get("ema_8_13_cross", pd.Series(0.0, index=out.index))
+    ema_13_48 = out.get("ema_13_48_cross", pd.Series(0.0, index=out.index))
+    ema_slope = out.get("ema_slope_21", pd.Series(0.0, index=out.index))
+
+    # ── Chesed/Gevurah Balance ──
+    # Expansion vs contraction: buy pressure weighted by relative volume
+    # minus sell pressure weighted by relative volume, smoothed with EMA8
+    expansion = buy_pct * rel_vol
+    contraction = sell_pct * rel_vol
+    raw_cg = expansion.ewm(span=8, adjust=False).mean() - contraction.ewm(span=8, adjust=False).mean()
+    # Normalize to [-1, +1] via tanh
+    out["chesed_gevurah_balance"] = np.tanh(raw_cg * 2).fillna(0)
+
+    # ── Tiferet Equilibrium ──
+    # Market balance state: mean of three neutrality measures
+    # RSI neutrality: 1 when RSI=50, 0 at extremes
+    # Compute RSI from returns
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi = (100 - 100 / (1 + rs)).fillna(50)
+    rsi_neutrality = 1 - (rsi - 50).abs() / 50
+
+    # Phase oscillator neutrality: 1 when osc=0, 0 at extremes
+    phase_neutrality = (1 - (phase_osc.abs() / 100).clip(upper=1)).fillna(0)
+
+    # Volume bias neutrality: 1 when bias=0, 0 at extremes
+    vb_neutrality = (1 - vol_bias.abs().clip(upper=1)).fillna(0)
+
+    out["tiferet_equilibrium"] = ((rsi_neutrality + phase_neutrality + vb_neutrality) / 3).fillna(0)
+
+    # ── Chesed/Gevurah Oscillator ──
+    # Speed of crowd psychology cycle: (EMA5 - EMA21) of balance × 100
+    cg_bal = out["chesed_gevurah_balance"]
+    cg_ema5 = cg_bal.ewm(span=5, adjust=False).mean()
+    cg_ema21 = cg_bal.ewm(span=21, adjust=False).mean()
+    out["chesed_gevurah_oscillator"] = ((cg_ema5 - cg_ema21) * 100).fillna(0)
+
+    # ── Sefirot Phase Alignment (Yesod) ──
+    # Phase-direction coherence: momentum aligned with oscillator direction
+    sign_osc = np.sign(phase_osc).replace(0, 1)
+    safe_comp = (1 + phase_comp.abs())
+    out["sefirot_phase_alignment"] = (phase_mom * sign_osc / safe_comp).fillna(0)
+
+    # ── Netzach Persistence ──
+    # Trend conviction: consecutive bars with same EMA8/13 cross sign
+    cross_sign = ema_8_13.fillna(0)
+    streak = pd.Series(0.0, index=out.index)
+    s = 0.0
+    prev_sign = 0.0
+    for i in range(n):
+        curr = float(cross_sign.iloc[i])
+        if curr == prev_sign and curr != 0:
+            s += 1.0
+        else:
+            s = 1.0 if curr != 0 else 0.0
+        streak.iloc[i] = s
+        prev_sign = curr
+    out["netzach_persistence"] = (streak / 21).clip(upper=1.0).fillna(0)
+
+    # ── Hod Technical Clarity ──
+    # Signal agreement across EMA crosses + slope direction
+    agreement = (ema_8_13.fillna(0) + ema_13_48.fillna(0) + np.sign(ema_slope.fillna(0))) / 3
+    out["hod_technical_clarity"] = agreement.abs().fillna(0)
+
+    # ── Fibonacci-Gematria Resonance ──
+    # Price proximity to Fibonacci EMAs (8, 13, 21, 55 — shared with gematria)
+    ema8 = close.ewm(span=8, adjust=False).mean()
+    ema13 = close.ewm(span=13, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema55 = close.ewm(span=55, adjust=False).mean()
+
+    resonances = []
+    for ema_val in [ema8, ema13, ema21, ema55]:
+        dist = (close - ema_val).abs() / safe_atr
+        resonances.append(np.exp(-dist.fillna(2)))
+    out["fibonacci_gematria_resonance"] = (sum(resonances) / 4).fillna(0)
+
+    return out
+
+
+_SEFIROT_COLS = [
+    "chesed_gevurah_balance", "tiferet_equilibrium", "chesed_gevurah_oscillator",
+    "sefirot_phase_alignment", "netzach_persistence", "hod_technical_clarity",
+    "fibonacci_gematria_resonance",
+]
+
+
+# ── 9. MASTER FEATURE BUILDER ──��─────────────────────────────────���───────
+
+# Final feature list — Saty-framework + TV technical + Sefirot behavioral
 FEATURE_COLS = [
     # ATR Levels
     "atr_14", "atr_pct", "price_vs_pivot", "atr_target_dist",
-    # EMA Ribbon (8, 13, 21, 48, 200)
-    "ema_ribbon_spread", "ema_8_13_cross", "ema_13_48_cross",
-    "ema_slope_21", "price_vs_ema21",
-    # Phase Oscillator (Wyckoff zones)
-    "phase_osc", "phase_zone", "phase_momentum", "phase_compression",
+    # EMA Ribbon (8, 13, 21, 48, 200) — pruned zero-importance crosses
+    "ema_ribbon_spread", "ema_slope_21", "price_vs_ema21",
+    # Phase Oscillator (Wyckoff zones) — pruned zero-importance phase_zone
+    "phase_osc", "phase_momentum", "phase_compression",
     # Volume Stack
     "buy_volume_pct", "sell_volume_pct", "volume_bias", "rel_volume",
-    # Cross-asset context
-    "vix_level", "vix_change_1d", "tlt_ret_1d",
-    # Momentum / regime
+    # Momentum / regime (pruned zero-importance VIX/TLT — stale cross-asset)
     "ret_5d", "ret_20d", "z_score_20",
+    # TV-equivalent technical indicators (RSI, MACD, Bollinger, Stochastic, ADX)
+    "rsi_14", "rsi_roc_3", "macd_hist_norm", "macd_hist_slope",
+    "bb_pct_b", "bb_width", "stoch_k", "adx_14",
+    # Sefirot behavioral (Tree of Life)
+    "chesed_gevurah_balance", "tiferet_equilibrium", "chesed_gevurah_oscillator",
+    "sefirot_phase_alignment", "netzach_persistence", "hod_technical_clarity",
+    "fibonacci_gematria_resonance",
 ]
+
+# Dead features removed (all had 0.000 importance across multiple retrains):
+# - ema_8_13_cross, ema_13_48_cross: binary crosses too noisy for GBM
+# - phase_zone: categorical encoded as int, no predictive value
+# - vix_level, vix_change_1d, tlt_ret_1d: stale cross-asset (fetched once, doesn't vary per-ticker)
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -336,6 +562,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out = compute_volume_stack(out)
     out = compute_cross_asset_features(out)
     out = compute_momentum_features(out)
+    out = compute_tv_technical_features(out)
+    out = compute_sefirot_features(out)
     return out
 
 

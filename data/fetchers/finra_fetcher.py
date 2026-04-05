@@ -2,6 +2,7 @@
 FINRA short volume fetcher — daily RegSHO short sale data.
 Downloads the daily consolidated short volume file from FINRA.
 """
+from __future__ import annotations
 import io
 import logging
 from datetime import datetime, timedelta

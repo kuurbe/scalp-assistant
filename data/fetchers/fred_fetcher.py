@@ -2,6 +2,7 @@
 FRED macro data fetcher — federal funds rate, yield curve, VIX, consumer sentiment.
 Uses direct FRED REST API via requests (avoids fredapi SSL hangs on macOS).
 """
+from __future__ import annotations
 import logging
 import os
 

@@ -43,18 +43,31 @@ class TTLCache:
 _cache = TTLCache()
 
 
+_SENTINEL = object()  # Distinguishes cache miss from cached None
+
 def cached(ttl: int = 300):
-    """Decorator that caches function results with TTL."""
+    """Decorator that caches function results with TTL.
+
+    Caches None results with a shorter TTL (60s) to avoid retrying
+    failed fetches every call while still allowing recovery.
+    """
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             key = f"{func.__module__}.{func.__name__}:{hashlib.md5(str((args, sorted(kwargs.items()))).encode()).hexdigest()}"
             result = _cache.get(key)
-            if result is not None:
+            if result is not _SENTINEL and result is not None:
                 return result
+            # Check if we have a cached None (negative cache)
+            neg_key = f"_neg_{key}"
+            if _cache.get(neg_key) is True:
+                return None
             result = func(*args, **kwargs)
             if result is not None:
                 _cache.set(key, result, ttl)
+            else:
+                # Cache None for 60s to avoid hammering failed endpoints
+                _cache.set(neg_key, True, min(ttl, 60))
             return result
         return wrapper
     return decorator

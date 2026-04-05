@@ -50,12 +50,30 @@ def run_morning_scan(top_n: int = None, tickers: str = None, asset_class: str = 
     reddit_data = _fetch_reddit()
     short_data = _fetch_short_volume(universe)
 
+    # 2b. Batch download all OHLCV data upfront (2 API calls instead of N*2)
+    daily_dict, intraday_dict = _batch_fetch_ohlcv(universe)
+    console.print(f"  Fetched data: {len(daily_dict)}/{len(universe)} daily, {len(intraday_dict)}/{len(universe)} intraday\n", style="dim")
+
+    # 2c. Pre-warm heavy imports before threading (avoids import lock contention)
+    try:
+        import joblib  # noqa
+        from analysis.ml.feature_engine import build_features as _bfn  # noqa
+        from analysis.ml.predictor import predict_ticker as _ptn  # noqa
+        from analysis.quant_formulas import compute_quant_signals as _qsn  # noqa
+    except Exception:
+        pass
+
     # 3. Analyze each ticker
     all_scored = []
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    fail_count = 0
+    # For crypto: pass BTC daily data for correlation computation
+    btc_daily = daily_dict.get("BTC-USD") if asset_class == "crypto" else None
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
         futures = {
             pool.submit(_analyze_ticker, ticker, macro_regime, reddit_data, short_data,
-                        political_pulse, war_watch, influencer_pulse, asset_class): ticker
+                        political_pulse, war_watch, influencer_pulse, asset_class,
+                        daily_dict.get(ticker), intraday_dict.get(ticker), btc_daily): ticker
             for ticker in universe
         }
         done_count = 0
@@ -63,9 +81,24 @@ def run_morning_scan(top_n: int = None, tickers: str = None, asset_class: str = 
             done_count += 1
             if done_count % 10 == 0:
                 console.print(f"  ...{done_count}/{len(universe)}", style="dim")
-            result = future.result()
-            if result:
-                all_scored.append(result)
+            try:
+                result = future.result(timeout=45)
+                if result:
+                    all_scored.append(result)
+                else:
+                    fail_count += 1
+            except Exception:
+                fail_count += 1
+
+    if fail_count > 0:
+        console.print(f"  [dim]{fail_count} tickers failed analysis[/dim]")
+
+    # Flush buffered ML prediction history to disk (one write instead of N)
+    try:
+        from analysis.ml.predictor import flush_pred_history
+        flush_pred_history()
+    except Exception:
+        pass
 
     # 4. Sort by composite score
     all_scored.sort(key=lambda x: x.composite_score, reverse=True)
@@ -94,17 +127,32 @@ def run_morning_scan(top_n: int = None, tickers: str = None, asset_class: str = 
 def _analyze_ticker(ticker: str, macro_regime: str, reddit_data: dict, short_data: dict,
                     political_pulse: dict = None, war_watch: dict = None,
                     influencer_pulse: dict = None,
-                    asset_class: str = "stocks") -> ScoredTicker | None:
-    """Full analysis pipeline for a single ticker."""
-    try:
-        from data.fetchers.yfinance_fetcher import get_daily_ohlcv, get_intraday_ohlcv
+                    asset_class: str = "stocks",
+                    prefetched_daily=None, prefetched_intraday=None,
+                    btc_daily=None) -> ScoredTicker | None:
+    """Full analysis pipeline for a single ticker.
 
-        # Fetch data
-        daily = get_daily_ohlcv(ticker)
+    Args:
+        prefetched_daily: Pre-fetched daily DataFrame (from batch download). Skips yfinance call if provided.
+        prefetched_intraday: Pre-fetched intraday DataFrame (from batch download). Skips yfinance call if provided.
+        btc_daily: BTC-USD daily DataFrame for crypto correlation computation.
+    """
+    try:
+        # Use pre-fetched data if available, otherwise fetch individually
+        if prefetched_daily is not None:
+            daily = prefetched_daily
+        else:
+            from data.fetchers.yfinance_fetcher import get_daily_ohlcv
+            daily = get_daily_ohlcv(ticker)
+
         if daily is None or len(daily) < 20:
             return None
 
-        intraday = get_intraday_ohlcv(ticker)
+        if prefetched_intraday is not None:
+            intraday = prefetched_intraday
+        else:
+            from data.fetchers.yfinance_fetcher import get_intraday_ohlcv
+            intraday = get_intraday_ohlcv(ticker)
 
         close = daily["Close"]
         price = float(close.iloc[-1])
@@ -112,12 +160,32 @@ def _analyze_ticker(ticker: str, macro_regime: str, reddit_data: dict, short_dat
         pct_change = ((price - prev) / prev) * 100 if prev > 0 else 0
         vol = float(daily["Volume"].iloc[-1])
         # Use 20-day average volume (excluding today) for relative volume
+        # Normalize for time of day — if market is open, scale up partial volume
         recent_vol = daily["Volume"].iloc[-21:-1] if len(daily) > 21 else daily["Volume"].iloc[:-1]
         avg_vol = float(recent_vol.mean()) if len(recent_vol) > 0 else vol
-        rel_volume = vol / avg_vol if avg_vol > 0 else 0
+        if avg_vol > 0:
+            rel_volume = vol / avg_vol
+            # Intraday normalization: if market is open, today's volume is partial
+            # Scale up based on elapsed fraction of trading day (9:30-4:00 = 390 min)
+            if asset_class not in ("forex", "crypto"):
+                try:
+                    from zoneinfo import ZoneInfo
+                    import datetime
+                    et = ZoneInfo("America/New_York")
+                    now = datetime.datetime.now(et)
+                    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+                    if market_open < now < market_close:
+                        elapsed_min = (now - market_open).total_seconds() / 60
+                        day_fraction = max(elapsed_min / 390, 0.1)  # at least 10%
+                        rel_volume = rel_volume / day_fraction  # scale up partial volume
+                except Exception:
+                    pass
+        else:
+            rel_volume = 0
 
-        # Skip low-activity tickers (forex/crypto have no volume data)
-        if price < 1:
+        # Skip penny stocks (not crypto/forex — those can be sub-$1 legitimately)
+        if price < 1 and asset_class not in ("crypto", "forex"):
             return None
         if asset_class not in ("forex", "crypto") and rel_volume < 0.1:
             return None
@@ -172,15 +240,18 @@ def _analyze_ticker(ticker: str, macro_regime: str, reddit_data: dict, short_dat
             0.15 * kalman_score
         )
 
-        # ML prediction score
-        ml_score = _ml_analysis(ticker, daily)
+        # ML prediction score (also returns featured_df for sefirot reuse + prediction dict)
+        ml_score, featured_df, ml_pred = _ml_analysis(ticker, daily)
 
         # Social intelligence analysis
         social_score_val, social_info = _social_analysis(
             ticker, political_pulse, war_watch, influencer_pulse
         )
 
-        return score_ticker(
+        # Sefirot behavioral analysis (reuses featured_df from ML)
+        sefirot_info = _sefirot_analysis(daily, ticker, featured_df=featured_df)
+
+        result = score_ticker(
             ticker=ticker,
             physics_score=physics_total,
             technical_score=tech_score,
@@ -196,8 +267,47 @@ def _analyze_ticker(ticker: str, macro_regime: str, reddit_data: dict, short_dat
             targets_data=targets,
             catalyst_info=cat_info,
             social_info=social_info,
+            sefirot_info=sefirot_info,
             asset_class=asset_class,
         )
+
+        # Quant formula engine (six formulas + whale detection)
+        # Runs AFTER score_ticker so we have the real composite score
+        quant = _quant_analysis(result, ml_pred, daily, intraday)
+
+        # Set quant formula fields on ScoredTicker
+        if quant:
+            result.kelly_fraction = quant.kelly_fraction
+            result.ev_gap = quant.ev_gap
+            result.kl_divergence = quant.kl_divergence
+            result.bayesian_posterior = quant.bayesian_posterior
+            result.stoikov_reservation = quant.stoikov_reservation
+            result.lmsr_mispricing = quant.lmsr_mispricing
+            result.quant_score = quant.quant_score
+            result.quant_aligned = quant.quant_aligned
+            result.quant_n_agreeing = quant.n_agreeing
+            result.whale_score = quant.whale_score
+            result.whale_volume_sigma = quant.whale_volume_sigma
+            result.whale_sweep_detected = quant.whale_sweep_detected
+            result.whale_golden_sweep = quant.whale_golden_sweep
+
+        # BTC correlation for crypto tickers
+        if asset_class == "crypto" and btc_daily is not None and ticker != "BTC-USD":
+            try:
+                ticker_ret = daily["Close"].pct_change().tail(20)
+                btc_ret = btc_daily["Close"].pct_change().tail(20)
+                corr = float(ticker_ret.corr(btc_ret))
+                result.btc_correlation_20d = round(corr, 3) if corr == corr else 0.0  # NaN check
+            except Exception:
+                pass
+
+        # Set ML prediction fields
+        result.predicted_return = ml_pred.get("predicted_return", 0.0)
+        result.bull_prob = ml_pred.get("bull_prob", 0.5)
+        result.ml_confidence = ml_pred.get("confidence", 0.0)
+        result.forecast_10d = ml_pred.get("forecast_10d", [])
+
+        return result
     except Exception:
         return None
 
@@ -517,13 +627,57 @@ def _kalman_analysis(close) -> float:
         return 50
 
 
-def _ml_analysis(ticker: str, daily) -> float:
-    """Run ML prediction model and return 0-100 score."""
+def _ml_analysis(ticker: str, daily) -> tuple:
+    """Run ML prediction model and return (score, featured_df, prediction_dict).
+
+    Returns featured_df so sefirot analysis can reuse it (avoids double build_features).
+    Returns prediction_dict for quant formula engine.
+    """
     try:
-        from analysis.ml.predictor import get_ml_score
-        return get_ml_score(ticker, df=daily)
+        from analysis.ml.predictor import predict_ticker
+        from analysis.ml.feature_engine import build_features
+        featured_df = build_features(daily)
+        pred = predict_ticker(ticker, df=daily, featured_df=featured_df)
+        score = pred.get("ml_score", 50.0) if pred else 50.0
+        return score, featured_df, pred or {}
     except Exception:
-        return 50.0
+        return 50.0, None, {}
+
+
+def _quant_analysis(scored_ticker, ml_pred: dict, daily, intraday):
+    """Run six-formula quant engine + whale detection. Returns QuantSignal or None."""
+    try:
+        from analysis.quant_formulas import compute_quant_signals
+        return compute_quant_signals(scored_ticker, ml_pred, daily, intraday)
+    except Exception:
+        return None
+
+
+def _sefirot_analysis(daily, ticker: str, featured_df=None) -> dict:
+    """Compute Sefirot behavioral features for a ticker. Returns info dict for scoring.
+
+    Args:
+        featured_df: Pre-built feature DataFrame (avoids duplicate build_features call).
+    """
+    try:
+        if featured_df is None:
+            from analysis.ml.feature_engine import build_features
+            featured_df = build_features(daily)
+        if featured_df is None or len(featured_df) < 1:
+            return {}
+
+        last = featured_df.iloc[-1]
+        return {
+            "balance": float(last.get("chesed_gevurah_balance", 0)),
+            "equilibrium": float(last.get("tiferet_equilibrium", 0)),
+            "oscillator": float(last.get("chesed_gevurah_oscillator", 0)),
+            "phase_alignment": float(last.get("sefirot_phase_alignment", 0)),
+            "netzach": float(last.get("netzach_persistence", 0)),
+            "hod_clarity": float(last.get("hod_technical_clarity", 0)),
+            "fib_resonance": float(last.get("fibonacci_gematria_resonance", 0)),
+        }
+    except Exception:
+        return {}
 
 
 def _social_analysis(ticker: str, political_pulse: dict = None,
@@ -653,6 +807,64 @@ def _fetch_influencer_pulse() -> dict:
         return get_influencer_pulse() or {}
     except Exception:
         return {}
+
+
+def _extract_ticker_from_batch(data, ticker: str, cols: list):
+    """Extract a single ticker's OHLCV from a yfinance batch download."""
+    import pandas as pd
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            available_tickers = data.columns.get_level_values(1).unique()
+            if ticker not in available_tickers:
+                return None
+            df = data.xs(ticker, level=1, axis=1)
+            available = [c for c in cols if c in df.columns]
+            df = df[available].dropna(how="all")
+        else:
+            available = [c for c in cols if c in data.columns]
+            df = data[available].dropna(how="all")
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def _batch_fetch_ohlcv(universe: list) -> tuple:
+    """Batch-download daily and intraday OHLCV for all tickers at once.
+
+    Returns (daily_dict, intraday_dict) where each maps ticker -> DataFrame.
+    """
+    import yfinance as yf
+
+    daily_dict = {}
+    intraday_dict = {}
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+
+    try:
+        period = getattr(settings, "YFINANCE_DAILY_PERIOD", "1y")
+        data = yf.download(universe, period=period, interval="1d",
+                           auto_adjust=True, threads=True, progress=False)
+        if data is not None and not data.empty:
+            for ticker in universe:
+                df = _extract_ticker_from_batch(data, ticker, cols)
+                if df is not None and len(df) >= 20:
+                    daily_dict[ticker] = df
+    except Exception:
+        pass
+
+    try:
+        intra_period = getattr(settings, "YFINANCE_INTRADAY_PERIOD", "5d")
+        intra_interval = getattr(settings, "YFINANCE_INTRADAY_INTERVAL", "1m")
+        data = yf.download(universe, period=intra_period, interval=intra_interval,
+                           auto_adjust=True, threads=True, progress=False, prepost=True)
+        if data is not None and not data.empty:
+            for ticker in universe:
+                df = _extract_ticker_from_batch(data, ticker, cols)
+                if df is not None:
+                    intraday_dict[ticker] = df
+    except Exception:
+        pass
+
+    return daily_dict, intraday_dict
 
 
 def _get_levels(ticker, daily, intraday) -> dict:

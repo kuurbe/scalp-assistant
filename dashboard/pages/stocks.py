@@ -21,7 +21,7 @@ def render():
             Stocks
         </div>
         <div style="font-size:14px; color:{COLORS['text_muted']};">
-            {"Scan 96 stocks to find the best trades today" if is_simple else "96 tickers — mega cap, biotech, energy, semis, meme, growth"}
+            {"Scan 108 stocks to find the best trades today" if is_simple else "108 tickers — mega cap, biotech, energy, semis, meme, growth"}
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -41,15 +41,21 @@ def render():
             <div style="font-size:16px; font-weight:500; color:{COLORS['text']}; margin-bottom:8px;">
                 {"Ready to find opportunities" if is_simple else "Stock Scanner Ready"}</div>
             <div style="font-size:14px; color:{COLORS['text_secondary']};">
-                {"Click below to scan 96 stocks and find the best opportunities" if is_simple else "Run the scanner to analyze 96 tickers across all sectors"}</div>
+                {"Click below to scan 108 stocks and find the best opportunities" if is_simple else "Run the scanner to analyze 108 tickers across all sectors"}</div>
         </div>
         """, unsafe_allow_html=True)
         if st.button("Scan Stocks" if not is_simple else "Find Best Stocks", type="primary"):
-            with st.spinner("Scanning 96 tickers..." if not is_simple else "Finding the best opportunities..."):
-                stocks = data_bridge.scan_universe("stocks")
-                st.session_state[cache_key] = stocks
-                st.session_state["overview_scan_results"] = stocks
-            st.rerun()
+            try:
+                with st.spinner("Scanning 108 tickers..." if not is_simple else "Finding the best opportunities..."):
+                    stocks = data_bridge.scan_universe("stocks")
+                if stocks:
+                    st.session_state[cache_key] = stocks
+                    st.session_state["overview_scan_results"] = stocks
+                    st.rerun()
+                else:
+                    st.error("Scan returned no results. Check logs for errors.")
+            except Exception as e:
+                st.error(f"Scan failed: {e}")
         return
 
     # Summary row — grouped overview card
@@ -94,6 +100,7 @@ def render():
     col_btn, col_space = st.columns([1, 4])
     with col_btn:
         if st.button("Refresh Scan", type="secondary"):
+            data_bridge.scan_universe.clear()
             with st.spinner("Scanning..."):
                 stocks = data_bridge.scan_universe("stocks")
                 st.session_state[cache_key] = stocks

@@ -137,13 +137,35 @@ def render():
 
         st.markdown(f'<div style="margin-bottom:24px;">{trend_html}</div>', unsafe_allow_html=True)
 
-    # ── Scan Results ─────────────────────────────────────────
-    with st.spinner("Scanning crypto universe..."):
-        crypto = data_bridge.scan_universe("crypto")
+    # ── Scan Results (non-blocking — session state cache) ────
+    cache_key = "crypto_scan_results"
+    crypto = st.session_state.get(cache_key, [])
 
     if not crypto:
-        st.info("No crypto scan data yet. The scanner will populate shortly.")
+        st.markdown(f"""
+        <div style="{CARD_CSS} text-align:center; padding:40px;">
+            <div style="font-size:16px; font-weight:500; color:{COLORS['text']}; margin-bottom:8px;">
+                {"Ready to scan crypto markets" if is_simple else "Crypto Scanner Ready"}</div>
+            <div style="font-size:14px; color:{COLORS['text_secondary']};">
+                {"Click below to scan 20 tokens" if is_simple else "Analyze 20 tokens across major cryptos"}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Scan Crypto" if not is_simple else "Find Best Crypto", type="primary"):
+            with st.spinner("Scanning crypto universe..."):
+                crypto = data_bridge.scan_universe("crypto")
+                st.session_state[cache_key] = crypto
+            st.rerun()
         return
+
+    # Refresh button
+    col_btn, _ = st.columns([1, 4])
+    with col_btn:
+        if st.button("Refresh Scan", type="secondary", key="crypto_refresh"):
+            data_bridge.scan_universe.clear()
+            with st.spinner("Scanning crypto..."):
+                crypto = data_bridge.scan_universe("crypto")
+                st.session_state[cache_key] = crypto
+            st.rerun()
 
     active = [c for c in crypto if c.composite_score >= 40]
 

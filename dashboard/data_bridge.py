@@ -45,6 +45,109 @@ def _prefetch_shared_data(asset_class: str) -> dict:
     return results
 
 
+def _extract_ticker_from_batch(data, ticker: str, cols: list) -> "pd.DataFrame | None":
+    """Extract a single ticker's OHLCV from a yfinance batch download.
+
+    yfinance returns MultiIndex columns: (Price, Ticker) for multi-ticker downloads,
+    or flat columns for single-ticker downloads.
+    """
+    import pandas as pd
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            # MultiIndex: levels are (Price, Ticker) — e.g. ('Close', 'AAPL')
+            available_tickers = data.columns.get_level_values(1).unique()
+            if ticker not in available_tickers:
+                return None
+            # Slice: get all price columns for this ticker
+            df = data.xs(ticker, level=1, axis=1)
+            available = [c for c in cols if c in df.columns]
+            df = df[available].dropna(how="all")
+        else:
+            # Flat columns (single ticker download)
+            available = [c for c in cols if c in data.columns]
+            df = data[available].dropna(how="all")
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def _batch_fetch_ohlcv(universe: list) -> tuple:
+    """Batch-download daily and intraday OHLCV for all tickers at once.
+
+    Returns (daily_dict, intraday_dict) where each maps ticker -> DataFrame.
+    Falls back gracefully if batch download fails.
+    """
+    import yfinance as yf
+    from config import settings
+
+    daily_dict = {}
+    intraday_dict = {}
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+
+    # Batch daily download (1 API call for all tickers)
+    try:
+        period = getattr(settings, "YFINANCE_DAILY_PERIOD", "1y")
+        data = yf.download(universe, period=period, interval="1d",
+                           auto_adjust=True, threads=True, progress=False)
+        if data is not None and not data.empty:
+            for ticker in universe:
+                df = _extract_ticker_from_batch(data, ticker, cols)
+                if df is not None and len(df) >= 20:
+                    daily_dict[ticker] = df
+    except Exception as e:
+        logger.warning("Batch daily download failed: %s", e)
+
+    # Batch intraday download (1 API call for all tickers)
+    try:
+        intra_period = getattr(settings, "YFINANCE_INTRADAY_PERIOD", "5d")
+        intra_interval = getattr(settings, "YFINANCE_INTRADAY_INTERVAL", "1m")
+        data = yf.download(universe, period=intra_period, interval=intra_interval,
+                           auto_adjust=True, threads=True, progress=False, prepost=True)
+        if data is not None and not data.empty:
+            for ticker in universe:
+                df = _extract_ticker_from_batch(data, ticker, cols)
+                if df is not None:
+                    intraday_dict[ticker] = df
+    except Exception as e:
+        logger.warning("Batch intraday download failed: %s", e)
+
+    logger.info("Batch fetch: %d/%d daily, %d/%d intraday",
+                len(daily_dict), len(universe), len(intraday_dict), len(universe))
+    return daily_dict, intraday_dict
+
+
+def _prewarm_imports():
+    """Pre-load heavy modules before spawning threads.
+
+    Python's import lock serializes imports across threads.
+    Loading everything upfront avoids 12 threads fighting over it.
+    """
+    try:
+        import joblib  # noqa
+        import numpy  # noqa
+        from analysis.ml.feature_engine import build_features, FEATURE_COLS  # noqa
+        from analysis.ml.predictor import predict_ticker  # noqa
+        from analysis.quant_formulas import compute_quant_signals  # noqa
+        from analysis.physics.kinematics import compute_kinematics  # noqa
+        from analysis.scoring.regime_classifier import classify_stock_regime  # noqa
+        from analysis.technical.cvd import get_cvd_signal  # noqa
+        from analysis.technical.obv import detect_obv_divergence  # noqa
+        from analysis.technical.candlestick import detect_all_patterns  # noqa
+        from analysis.physics.ou_process import get_ou_score  # noqa
+        from analysis.physics.hurst import get_hurst_score  # noqa
+        from analysis.physics.entropy import get_predictability_score  # noqa
+        from analysis.physics.kalman import get_kalman_score  # noqa
+        from analysis.statistical.garch import get_garch_score  # noqa
+        from analysis.statistical.zscore import get_zscore_signal  # noqa
+        from analysis.statistical.gbm_monte_carlo import get_gbm_score  # noqa
+
+        # Pre-load the ML models into the cache (avoids 12 threads hitting disk)
+        from analysis.ml.predictor import _get_cached_models
+        _get_cached_models("universal")
+    except Exception:
+        pass
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def scan_universe(asset_class: str) -> list:
     """Run the full analysis pipeline on an asset class universe.
@@ -60,6 +163,10 @@ def scan_universe(asset_class: str) -> list:
 
     from modes.morning_scan import _analyze_ticker
 
+    # Pre-warm imports and ML models BEFORE spawning threads
+    # Python's import lock serializes threaded imports — this avoids the 15s+ penalty
+    _prewarm_imports()
+
     # Pre-warm all shared data concurrently (parallel fetches)
     shared = _prefetch_shared_data(asset_class)
     macro_regime = shared.get("macro", "NEUTRAL")
@@ -69,22 +176,47 @@ def scan_universe(asset_class: str) -> list:
     war_watch = shared.get("war", {})
     influencer_pulse = shared.get("influencer", {})
 
+    # Batch download all OHLCV data upfront (2 API calls instead of 192)
+    daily_dict, intraday_dict = _batch_fetch_ohlcv(universe)
+
     results = []
+    success_count = 0
+    fail_count = 0
+
+    # For crypto: pass BTC daily data for correlation computation
+    btc_daily = daily_dict.get("BTC-USD") if asset_class == "crypto" else None
+
     with ThreadPoolExecutor(max_workers=12) as pool:
         futures = {
             pool.submit(
                 _analyze_ticker, ticker, macro_regime, reddit_data, short_data,
-                political_pulse, war_watch, influencer_pulse, asset_class
+                political_pulse, war_watch, influencer_pulse, asset_class,
+                daily_dict.get(ticker), intraday_dict.get(ticker), btc_daily
             ): ticker
             for ticker in universe
         }
         for future in as_completed(futures):
+            ticker = futures[future]
             try:
-                result = future.result()
+                result = future.result(timeout=45)
                 if result:
                     results.append(result)
-            except Exception:
-                pass
+                    success_count += 1
+                else:
+                    fail_count += 1
+            except Exception as e:
+                fail_count += 1
+                logger.debug("Ticker %s failed: %s", ticker, e)
+
+    logger.info("Scan %s: %d scored, %d failed, %d total",
+                asset_class, success_count, fail_count, len(universe))
+
+    # Flush buffered prediction history (one disk write instead of N)
+    try:
+        from analysis.ml.predictor import flush_pred_history
+        flush_pred_history()
+    except Exception:
+        pass
 
     results.sort(key=lambda x: x.composite_score, reverse=True)
     return results

@@ -2,6 +2,7 @@
 Reddit / social sentiment fetcher — WSB trending tickers via Ape Wisdom API.
 No authentication required.
 """
+from __future__ import annotations
 import logging
 
 import requests
