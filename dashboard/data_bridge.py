@@ -12,7 +12,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
-import streamlit as st
+try:
+    import streamlit as st
+except ImportError:
+    # Running outside Streamlit (e.g. scan_and_alert.py) — stub cache_data as a no-op
+    class _StStub:
+        @staticmethod
+        def cache_data(ttl=300, show_spinner=False):
+            def decorator(fn):
+                return fn
+            return decorator
+    st = _StStub()
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)

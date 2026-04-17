@@ -1168,13 +1168,19 @@ def send_test_alert() -> None:
     et = ZoneInfo("America/New_York")
     now = datetime.datetime.now(et).strftime("%b %d, %I:%M %p ET")
 
+    # Dynamic expiry dates so the test alert never shows stale dates
+    _today = datetime.date.today()
+    _days_to_fri = (4 - _today.weekday()) % 7 or 7
+    _exp1 = (_today + datetime.timedelta(days=_days_to_fri)).strftime("%b %d")
+    _exp2 = (_today + datetime.timedelta(days=_days_to_fri + 7)).strftime("%b %d")
+
     msg = (
         f"📡 <b>Scalp Assistant</b> — {now}\n"
         f"{'━' * 30}\n\n"
         f"<b>🎯 OPTIONS PLAYS</b>\n\n"
         f"<b>CALLS (2)</b>\n\n"
         f"🟢 <b>CALL — TSLA</b>  (Score: 72)\n"
-        f"   Strike: <code>$420</code>  |  Exp: Mar 21  |  Budget: $100-$300\n"
+        f"   Strike: <code>$420</code>  |  Exp: {_exp1}  |  Budget: $100-$300\n"
         f"   Price: <code>$407.82</code> (+2.1%)  |  Confidence: 78%\n"
         f"   Regime: STRONG_TREND  |  Phase: IGNITION  |  RVOL: 3.2x\n"
         f"   Support: <code>$395.50</code>  |  Resistance: <code>$425.00</code>\n"
@@ -1182,13 +1188,13 @@ def send_test_alert() -> None:
         f"   • Momentum ignition with volume surge\n"
         f"   • RSI recovering from oversold\n\n"
         f"🟢 <b>CALL — HIMS</b>  (Score: 68)\n"
-        f"   Strike: <code>$27</code>  |  Exp: Mar 21  |  Budget: $40-$100\n"
+        f"   Strike: <code>$27</code>  |  Exp: {_exp1}  |  Budget: $40-$100\n"
         f"   Price: <code>$25.88</code> (+10.3%)  |  Confidence: 71%\n"
         f"   Regime: CLEAN_REVERSION  |  Phase: ACCELERATION  |  RVOL: 4.1x\n"
         f"   • Strong catalyst + volume breakout\n\n"
         f"<b>PUTS (1)</b>\n\n"
         f"🔴 <b>PUT — BBIO</b>  (Score: 61)\n"
-        f"   Strike: <code>$68</code>  |  Exp: Mar 21  |  Budget: $80-$180\n"
+        f"   Strike: <code>$68</code>  |  Exp: {_exp1}  |  Budget: $80-$180\n"
         f"   Price: <code>$71.39</code> (-3.9%)  |  Confidence: 65%\n"
         f"   Regime: RANDOM  |  Phase: DECEL  |  RVOL: 0.8x\n"
         f"   • Overbought RSI + weakening momentum\n\n"
@@ -1225,7 +1231,7 @@ def send_test_alert() -> None:
         f"🔵 <b>SWING — INTC</b>  (BUY 68%)\n"
         f"   Price: <code>$47.98</code> (+2.6%)  |  Score: 59\n"
         f"   Regime: STRONG_TREND  |  Hurst: 0.62  |  RVOL: 1.8x\n"
-        f"   Option: CALL <code>$50</code> exp Mar 28  |  Budget: $80-$180\n"
+        f"   Option: CALL <code>$50</code> exp {_exp2}  |  Budget: $80-$180\n"
         f"   Support: <code>$46.20</code>  |  Resistance: <code>$50.50</code>\n"
         f"   • Trending regime with institutional accumulation\n\n"
         f"🔵 <b>SWING — MARA</b>  (BUY 64%)\n"
