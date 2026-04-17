@@ -54,6 +54,7 @@ _ALERT_TYPE_KEYWORDS = [
 _TICKER_BLACKLIST = {
     "ACT", "NOW", "NEW", "THE", "AND", "FOR", "BUY", "SELL", "WITH", "FROM",
     "CALL", "PUT", "ITM", "OTM", "ATM", "VIX", "ET", "PT", "CT", "EST",
+    "AM", "PM", "MST", "CST", "MDT", "CDT", "EDT", "PDT", "UTC", "GMT",
     "RSI", "MACD", "EMA", "SMA", "VWAP", "ORB", "BB", "OI", "IV", "RV",
     "EOD", "DTE", "USD", "WIN", "LOSS", "PNL", "P", "L", "RR", "PCR",
     "SCALP", "ALERT", "EVENT", "PHOTO", "CRYPTO", "STOCK", "ETF", "FED",
@@ -62,6 +63,7 @@ _TICKER_BLACKLIST = {
     "SWING", "INVEST", "DAY", "WEEK", "MONTH", "YEAR", "GAIN", "LOSS",
     "BIG", "BAD", "BULL", "BEAR", "HIGH", "LOW", "OPEN", "CLOSE", "TOP",
     "BOT", "BOTS", "LONG", "SHORT", "FLAT", "OK", "NA", "FYI", "TBD",
+    "MONITOR", "SUMMARY", "SCAN", "TOTAL", "SETUPS", "RVOL", "NOTE",
 }
 
 

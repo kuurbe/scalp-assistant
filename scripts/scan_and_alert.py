@@ -695,8 +695,8 @@ def _send_candlestick_for_pick(pick, chat_id=None) -> None:
 
     # Fallback: matplotlib candlestick
     try:
-        import yfinance as yf
-        df = yf.download(pick.ticker, period="3mo", interval="1d", progress=False)
+        from data.fetchers.yfinance_fetcher import safe_yf_download
+        df = safe_yf_download(pick.ticker, period="3mo", interval="1d")
         if df is None or len(df) < 10:
             return
         chart = generate_candlestick_chart(

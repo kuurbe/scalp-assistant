@@ -833,7 +833,9 @@ def _batch_fetch_ohlcv(universe: list) -> tuple:
 
     Returns (daily_dict, intraday_dict) where each maps ticker -> DataFrame.
     """
-    import yfinance as yf
+    # Use thread-safe wrapper — the raw yf.download spawns its own internal
+    # threads that race on the SQLite cookie/tz cache, corrupting crypto fetches.
+    from data.fetchers.yfinance_fetcher import safe_yf_download
 
     daily_dict = {}
     intraday_dict = {}
@@ -841,8 +843,8 @@ def _batch_fetch_ohlcv(universe: list) -> tuple:
 
     try:
         period = getattr(settings, "YFINANCE_DAILY_PERIOD", "1y")
-        data = yf.download(universe, period=period, interval="1d",
-                           auto_adjust=True, threads=True, progress=False)
+        data = safe_yf_download(universe, period=period, interval="1d",
+                                auto_adjust=True)
         if data is not None and not data.empty:
             for ticker in universe:
                 df = _extract_ticker_from_batch(data, ticker, cols)
@@ -854,8 +856,8 @@ def _batch_fetch_ohlcv(universe: list) -> tuple:
     try:
         intra_period = getattr(settings, "YFINANCE_INTRADAY_PERIOD", "5d")
         intra_interval = getattr(settings, "YFINANCE_INTRADAY_INTERVAL", "1m")
-        data = yf.download(universe, period=intra_period, interval=intra_interval,
-                           auto_adjust=True, threads=True, progress=False, prepost=True)
+        data = safe_yf_download(universe, period=intra_period, interval=intra_interval,
+                                auto_adjust=True, prepost=True)
         if data is not None and not data.empty:
             for ticker in universe:
                 df = _extract_ticker_from_batch(data, ticker, cols)

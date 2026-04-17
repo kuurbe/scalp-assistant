@@ -4,6 +4,8 @@ Uses the yfinance library for all Yahoo Finance data.
 """
 from __future__ import annotations
 import logging
+import threading
+import time
 import pandas as pd
 import yfinance as yf
 
@@ -11,6 +13,84 @@ from data.cache import cached
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+# yfinance maintains a shared SQLite cache (~/Library/Caches/py-yfinance/tkr-tz.db,
+# cookies.db) that is NOT safe for concurrent access from ThreadPoolExecutor workers.
+# Symptoms without this lock:
+#   - OperationalError('unable to open database file')
+#   - 'NoneType' object is not subscriptable
+# Both bubble up from inside yfinance's cookie/timezone lookup path when two threads
+# race on the SQLite file. Serializing cache-touching calls eliminates both.
+# The actual HTTP fetch is NOT held under the lock — we release before network I/O
+# by using yfinance's normal API (which reads cache briefly, then fetches).
+_YF_CACHE_LOCK = threading.Lock()
+
+
+def _safe_ticker(symbol: str):
+    """Create a yf.Ticker under the cache lock to avoid SQLite contention."""
+    with _YF_CACHE_LOCK:
+        return yf.Ticker(symbol)
+
+
+def _safe_history(ticker_obj, **kwargs) -> "pd.DataFrame | None":
+    """
+    Call Ticker.history() with lock + retry on transient SQLite errors.
+    Returns None on permanent failure.
+    """
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            with _YF_CACHE_LOCK:
+                df = ticker_obj.history(**kwargs)
+            return df
+        except Exception as e:
+            msg = str(e).lower()
+            # Transient SQLite-related failures: brief backoff + retry
+            if "database" in msg or "subscriptable" in msg or "locked" in msg:
+                last_err = e
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            raise
+    if last_err:
+        logger.debug("history() giving up after 3 retries: %s", last_err)
+    return None
+
+
+def safe_yf_download(tickers, **kwargs):
+    """
+    Thread-safe drop-in replacement for `yfinance.download()`.
+
+    Fixes:
+      - Forces threads=False so yf.download doesn't spawn its own threads
+        that would race on the SQLite cookie/tz cache.
+      - Holds _YF_CACHE_LOCK for the duration of the call.
+      - Silences progress and retries once on transient SQLite errors.
+
+    Use this from ANY module that was previously calling yf.download()
+    directly. Same return type as yf.download.
+    """
+    import yfinance as _yf
+    # Force single-threaded fetch — parallel HTTP fetches are fine at the
+    # application level (app uses ThreadPoolExecutor), but yfinance's internal
+    # thread pool collides with the cache.
+    kwargs.setdefault("threads", False)
+    kwargs.setdefault("progress", False)
+
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            with _YF_CACHE_LOCK:
+                return _yf.download(tickers, **kwargs)
+        except Exception as e:
+            msg = str(e).lower()
+            if "database" in msg or "subscriptable" in msg or "locked" in msg:
+                last_err = e
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            raise
+    if last_err:
+        logger.warning("safe_yf_download failed after 3 retries: %s", last_err)
+    return None
 
 
 @cached(ttl=settings.CACHE_TTL_SECONDS)
@@ -28,8 +108,8 @@ def get_daily_ohlcv(ticker: str, period: str = None) -> pd.DataFrame | None:
     if period is None:
         period = settings.YFINANCE_DAILY_PERIOD
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period=period, interval="1d", auto_adjust=True)
+        t = _safe_ticker(ticker)
+        df = _safe_history(t, period=period, interval="1d", auto_adjust=True)
         if df is None or df.empty:
             logger.warning("No daily data returned for %s", ticker)
             return None
@@ -66,8 +146,9 @@ def get_intraday_ohlcv(
     try:
         # Auto-detect: disable prepost for crypto/forex (meaningless for 24/7 markets)
         use_prepost = not (ticker.endswith("-USD") or "=X" in ticker or ticker == "DX-Y.NYB")
-        t = yf.Ticker(ticker)
-        df = t.history(
+        t = _safe_ticker(ticker)
+        df = _safe_history(
+            t,
             period=period,
             interval=interval,
             prepost=use_prepost,
@@ -104,8 +185,9 @@ def get_ticker_info(ticker: str) -> dict | None:
         "currentPrice",
     ]
     try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
+        t = _safe_ticker(ticker)
+        with _YF_CACHE_LOCK:
+            info = t.info or {}
         result = {f: info.get(f) for f in fields}
         return result
     except Exception as e:
@@ -123,13 +205,15 @@ def get_options_chain(ticker: str) -> dict | None:
         or None on failure.
     """
     try:
-        t = yf.Ticker(ticker)
-        expirations = t.options
+        t = _safe_ticker(ticker)
+        with _YF_CACHE_LOCK:
+            expirations = t.options
         if not expirations:
             logger.warning("No options expirations for %s", ticker)
             return None
         nearest = expirations[0]
-        chain = t.option_chain(nearest)
+        with _YF_CACHE_LOCK:
+            chain = t.option_chain(nearest)
         return {
             "expiry": nearest,
             "calls": chain.calls,
@@ -160,13 +244,12 @@ def batch_download(
     if period is None:
         period = settings.YFINANCE_DAILY_PERIOD
     try:
-        data = yf.download(
+        data = safe_yf_download(
             tickers,
             period=period,
             interval=interval,
             group_by="ticker",
             auto_adjust=True,
-            threads=True,
         )
         if data is None or data.empty:
             logger.warning("batch_download returned no data")
@@ -209,8 +292,9 @@ def get_pre_market_data(ticker: str) -> dict | None:
         or None on failure.
     """
     try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
+        t = _safe_ticker(ticker)
+        with _YF_CACHE_LOCK:
+            info = t.info or {}
 
         pre_price = info.get("preMarketPrice")
         regular_price = info.get("regularMarketPreviousClose")

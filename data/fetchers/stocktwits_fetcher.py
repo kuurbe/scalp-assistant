@@ -39,10 +39,17 @@ def _check_rate_limit() -> bool:
         t for t in _rate_limit_state["requests"] if t > cutoff
     ]
     if len(_rate_limit_state["requests"]) >= _rate_limit_state["max_per_hour"]:
-        logger.warning("Stocktwits rate limit approaching — backing off")
+        # Debug level — this path fires hundreds of times per scan cycle after we
+        # hit the hourly cap; warning-level spam drowns out real errors. The first
+        # hit of the cap is logged once at INFO by the caller below.
+        logger.debug("Stocktwits rate limit approaching — backing off")
         return False
     _rate_limit_state["requests"].append(now)
     return True
+
+
+# Emit a single INFO line the first time we hit the cap per process/hour.
+_rate_limit_announced = {"at": 0.0}
 
 
 def _api_get(url: str, params: dict | None = None) -> dict | None:
@@ -51,12 +58,24 @@ def _api_get(url: str, params: dict | None = None) -> dict | None:
     Returns parsed JSON dict on success, None on any failure.
     """
     if not _check_rate_limit():
-        logger.warning("Stocktwits rate limit reached, skipping request: %s", url)
+        # One-shot info line per hour so we know we're capped without spam
+        now = time.time()
+        if now - _rate_limit_announced["at"] > 3600:
+            logger.info("Stocktwits hourly cap reached — skipping until cooldown")
+            _rate_limit_announced["at"] = now
+        logger.debug("Stocktwits rate limit reached, skipping request: %s", url)
         return None
     try:
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 429:
-            logger.warning("Stocktwits 429 rate limited — backing off")
+            # Trip our local rate limiter so subsequent calls skip without spam
+            _rate_limit_state["requests"].extend(
+                [time.time()] * _rate_limit_state["max_per_hour"]
+            )
+            now = time.time()
+            if now - _rate_limit_announced["at"] > 3600:
+                logger.info("Stocktwits 429 from API — entering cooldown")
+                _rate_limit_announced["at"] = now
             return None
         resp.raise_for_status()
         return resp.json()

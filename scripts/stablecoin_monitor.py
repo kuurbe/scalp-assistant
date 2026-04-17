@@ -26,7 +26,7 @@ def scan_stablecoins() -> list:
     [{"ticker": "USDT-USD", "price": 0.994, "deviation": 0.006,
       "severity": "WARN", "volume_spike": 2.1}, ...]
     """
-    import yfinance as yf
+    from data.fetchers.yfinance_fetcher import safe_yf_download
 
     universe = settings.STABLECOIN_UNIVERSE
     if not universe:
@@ -35,8 +35,8 @@ def scan_stablecoins() -> list:
     events = []
 
     try:
-        data = yf.download(universe, period="8d", interval="1d",
-                           auto_adjust=True, threads=True, progress=False)
+        data = safe_yf_download(universe, period="8d", interval="1d",
+                                auto_adjust=True)
         if data is None or data.empty:
             return []
 
