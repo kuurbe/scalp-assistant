@@ -7,7 +7,7 @@ import logging
 import os
 import time
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -104,7 +104,7 @@ def get_company_news(ticker: str, days_back: int = 3) -> list[dict]:
     Returns:
         List of dicts with headline, summary, source, url, datetime.
     """
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     from_date = (today - timedelta(days=days_back)).isoformat()
     to_date = today.isoformat()
 
@@ -122,8 +122,8 @@ def get_company_news(ticker: str, days_back: int = 3) -> list[dict]:
             "summary": item.get("summary", ""),
             "source": item.get("source", ""),
             "url": item.get("url", ""),
-            "datetime": datetime.utcfromtimestamp(
-                item.get("datetime", 0)
+            "datetime": datetime.fromtimestamp(
+                item.get("datetime", 0), tz=timezone.utc
             ).isoformat() if item.get("datetime") else None,
         })
     return results
@@ -151,8 +151,8 @@ def get_market_news(category: str = "general") -> list[dict]:
             "summary": item.get("summary", ""),
             "source": item.get("source", ""),
             "url": item.get("url", ""),
-            "datetime": datetime.utcfromtimestamp(
-                item.get("datetime", 0)
+            "datetime": datetime.fromtimestamp(
+                item.get("datetime", 0), tz=timezone.utc
             ).isoformat() if item.get("datetime") else None,
         })
     return results

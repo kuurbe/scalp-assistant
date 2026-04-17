@@ -20,9 +20,14 @@ def kde_support_resistance(df: pd.DataFrame, n_levels: int = 200, bandwidth_pct:
         if len(prices) < 10:
             return []
 
-        # Weight prices by volume (repeat each price proportional to volume)
-        # Use sampling approach for efficiency
-        weights = volumes / volumes.sum()
+        # Weight prices by volume (repeat each price proportional to volume).
+        # Fall back to equal weights when volume is zero (e.g. holiday bars or
+        # some crypto listings with all-zero volume) to avoid divide-by-zero.
+        vol_sum = volumes.sum()
+        if vol_sum > 0:
+            weights = volumes / vol_sum
+        else:
+            weights = np.full_like(prices, 1.0 / len(prices), dtype=float)
 
         p_min, p_max = prices.min(), prices.max()
         price_range = p_max - p_min

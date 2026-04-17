@@ -5,7 +5,7 @@ Downloads the daily consolidated short volume file from FINRA.
 from __future__ import annotations
 import io
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -33,7 +33,7 @@ def _get_trade_date(date: str | None = None) -> str:
     if date:
         return date
 
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     # Default to yesterday
     target = today - timedelta(days=1)
     # Skip weekends: Saturday -> Friday, Sunday -> Friday

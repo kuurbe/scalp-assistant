@@ -40,15 +40,20 @@ def compute_cvd(df: pd.DataFrame) -> pd.DataFrame:
 
     bar_range = high - low
 
-    # Buy ratio: proportion of bar attributed to buying
-    # When range is zero (doji with no wicks), default to 0.5
-    buy_ratio = np.where(
-        bar_range == 0,
-        0.5,
-        (close - low) / bar_range,
-    )
+    # Buy ratio: proportion of bar attributed to buying.
+    # When range is zero (doji with no wicks), default to 0.5.
+    # np.where evaluates BOTH branches eagerly — the division still fires on
+    # zero-range bars and emits a RuntimeWarning even though np.where picks 0.5.
+    # Suppressing it is correct here because we handle the edge case explicitly.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        buy_ratio = np.where(
+            bar_range == 0,
+            0.5,
+            (close - low) / bar_range,
+        )
 
-    # Clamp to [0, 1] for safety
+    # Clamp to [0, 1] for safety (also turns any residual NaN/Inf into a bound)
+    buy_ratio = np.nan_to_num(buy_ratio, nan=0.5, posinf=1.0, neginf=0.0)
     buy_ratio = np.clip(buy_ratio, 0.0, 1.0)
 
     # Delta: positive = net buying, negative = net selling

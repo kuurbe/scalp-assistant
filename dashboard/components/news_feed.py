@@ -19,13 +19,13 @@ def _time_ago(published) -> str:
             if dt.tzinfo:
                 dt = dt.replace(tzinfo=None)
         elif isinstance(published, (int, float)):
-            dt = datetime.datetime.utcfromtimestamp(published)
+            dt = datetime.datetime.fromtimestamp(published, tz=datetime.timezone.utc).replace(tzinfo=None)
         elif isinstance(published, datetime.datetime):
             dt = published.replace(tzinfo=None) if published.tzinfo else published
         else:
             return ""
 
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         diff = now - dt
         seconds = diff.total_seconds()
 

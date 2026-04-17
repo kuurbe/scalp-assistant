@@ -64,20 +64,21 @@ def safe_yf_download(tickers, **kwargs):
       - Forces threads=False so yf.download doesn't spawn its own threads
         that would race on the SQLite cookie/tz cache.
       - Holds _YF_CACHE_LOCK for the duration of the call.
-      - Silences progress and retries once on transient SQLite errors.
+      - Silences progress output.
+      - Retries up to 5x on transient SQLite errors with jittered backoff.
+      - On final failure of a multi-ticker batch, falls back to fetching each
+        ticker individually via _safe_history — much slower but resilient.
 
     Use this from ANY module that was previously calling yf.download()
     directly. Same return type as yf.download.
     """
+    import random
     import yfinance as _yf
-    # Force single-threaded fetch — parallel HTTP fetches are fine at the
-    # application level (app uses ThreadPoolExecutor), but yfinance's internal
-    # thread pool collides with the cache.
     kwargs.setdefault("threads", False)
     kwargs.setdefault("progress", False)
 
     last_err: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             with _YF_CACHE_LOCK:
                 return _yf.download(tickers, **kwargs)
@@ -85,11 +86,43 @@ def safe_yf_download(tickers, **kwargs):
             msg = str(e).lower()
             if "database" in msg or "subscriptable" in msg or "locked" in msg:
                 last_err = e
-                time.sleep(0.2 * (attempt + 1))
+                # Jittered backoff: 0.5, 1.0, 1.5, 2.0, 2.5s +/- random
+                time.sleep(0.5 * (attempt + 1) + random.uniform(0, 0.3))
                 continue
             raise
+
+    # Batch path exhausted retries — fall back to one-at-a-time fetches so a
+    # single bad ticker doesn't kill the whole batch. This is slower but
+    # resilient under heavy concurrent load.
+    if isinstance(tickers, (list, tuple)) and len(tickers) > 1:
+        logger.debug("safe_yf_download batch failed — falling back to per-ticker fetches")
+        import pandas as _pd
+        # Keep only history-relevant kwargs
+        hist_kwargs = {k: v for k, v in kwargs.items()
+                       if k in ("period", "interval", "auto_adjust", "prepost",
+                                "start", "end", "actions")}
+        parts: dict[str, _pd.DataFrame] = {}
+        for sym in tickers:
+            try:
+                t = _safe_ticker(sym)
+                df = _safe_history(t, **hist_kwargs)
+                if df is not None and not df.empty:
+                    parts[sym] = df
+            except Exception:
+                continue
+        if not parts:
+            if last_err:
+                logger.warning("safe_yf_download per-ticker fallback also failed: %s", last_err)
+            return None
+        # Reassemble into group_by="ticker" MultiIndex to match yf.download output
+        try:
+            return _pd.concat(parts, axis=1)
+        except Exception:
+            # If concat fails, return the dict directly — callers handle both
+            return parts
+
     if last_err:
-        logger.warning("safe_yf_download failed after 3 retries: %s", last_err)
+        logger.warning("safe_yf_download failed after 5 retries: %s", last_err)
     return None
 
 

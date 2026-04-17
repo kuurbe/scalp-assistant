@@ -4,7 +4,7 @@ Uses the SEC EDGAR API with required User-Agent header.
 """
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -124,7 +124,7 @@ def get_recent_8k_filings(ticker: str, days_back: int = 5) -> list[dict]:
         accession_numbers = recent.get("accessionNumber", [])
         items_list = recent.get("items", [])
 
-        cutoff = (datetime.utcnow() - timedelta(days=days_back)).date()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).date()
         results = []
 
         for i, form in enumerate(forms):

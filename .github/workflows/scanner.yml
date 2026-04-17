@@ -50,6 +50,10 @@ jobs:
           FRED_KEY: ${{ secrets.FRED_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Crypto alerts route to a separate bot + chat when these are set.
+          # Add via: gh secret set TELEGRAM_CRYPTO_BOT_TOKEN / TELEGRAM_CRYPTO_CHAT_ID
+          TELEGRAM_CRYPTO_BOT_TOKEN: ${{ secrets.TELEGRAM_CRYPTO_BOT_TOKEN }}
+          TELEGRAM_CRYPTO_CHAT_ID: ${{ secrets.TELEGRAM_CRYPTO_CHAT_ID }}
         run: |
           if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
             python -m scripts.scan_and_alert --test

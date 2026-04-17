@@ -92,9 +92,14 @@ ETF_UNIVERSE = [
 CRYPTO_UNIVERSE = [
     "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD",
     "ADA-USD", "AVAX-USD", "DOT-USD", "LINK-USD",
-    "UNI-USD", "ATOM-USD", "APT-USD", "ARB-USD", "OP-USD",
+    "ATOM-USD", "ARB-USD", "OP-USD",
     "NEAR-USD", "FIL-USD", "RENDER-USD", "FET-USD", "INJ-USD",
-    "POL-USD",  # formerly MATIC
+    # Removed 2026-04-17 — returned no price data on yfinance ("possibly delisted"):
+    #   UNI-USD  — Uniswap feed unresponsive on Yahoo
+    #   APT-USD  — Aptos feed unresponsive on Yahoo
+    #   POL-USD  — Polygon rebrand; neither POL nor MATIC alias returns data
+    # Re-add if Yahoo restores these feeds. Also monitor ARB-USD — Yahoo returns
+    # $0.0007 which does not match Arbitrum's real price; may be a different token.
 ]
 
 # ─────────────────────────────────────────────────────────────
@@ -494,12 +499,13 @@ TV_TICKER_MAP = {
     "SOL-USD": "COINBASE:SOLUSD", "XRP-USD": "COINBASE:XRPUSD",
     "DOGE-USD": "COINBASE:DOGEUSD", "ADA-USD": "COINBASE:ADAUSD",
     "AVAX-USD": "COINBASE:AVAXUSD", "DOT-USD": "COINBASE:DOTUSD",
-    "LINK-USD": "COINBASE:LINKUSD", "UNI-USD": "COINBASE:UNIUSD",
-    "ATOM-USD": "COINBASE:ATOMUSD", "APT-USD": "COINBASE:APTUSD",
+    "LINK-USD": "COINBASE:LINKUSD",
+    "ATOM-USD": "COINBASE:ATOMUSD",
     "ARB-USD": "COINBASE:ARBUSD", "OP-USD": "COINBASE:OPUSD",
     "NEAR-USD": "COINBASE:NEARUSD", "FIL-USD": "COINBASE:FILUSD",
     "RENDER-USD": "COINBASE:RENDERUSD", "FET-USD": "COINBASE:FETUSD",
-    "INJ-USD": "COINBASE:INJUSD", "POL-USD": "COINBASE:POLUSD",
+    "INJ-USD": "COINBASE:INJUSD",
+    # UNI / APT / POL removed 2026-04-17 — yfinance fetch dead (see CRYPTO_UNIVERSE)
     # Forex
     "EURUSD=X": "FX:EURUSD", "GBPUSD=X": "FX:GBPUSD", "USDJPY=X": "FX:USDJPY",
     "USDCHF=X": "FX:USDCHF", "AUDUSD=X": "FX:AUDUSD", "USDCAD=X": "FX:USDCAD",
