@@ -1,1 +1,1 @@
-{"wf_hit_rate": 52.7, "wf_r2": -0.0173, "dummy_baseline": 53.5, "class_balance": 0.535, "n_features": 32, "sharpe": 14.394, "pred_mean": 0.0785, "pred_std": 0.0866}
+{"wf_hit_rate": 52.4, "wf_r2": -0.0173, "dummy_baseline": 53.5, "class_balance": 0.535, "n_features": 32, "sharpe": 14.394, "pred_mean": 0.0785, "pred_std": 0.0866}

@@ -18,5 +18,15 @@
     "n_samples": 709,
     "n_features": 32,
     "warnings": 1
+  },
+  {
+    "date": "2026-04-05T07:58:40.518251",
+    "hit_rate": 52.4,
+    "r2": -0.0173,
+    "sharpe": 14.394,
+    "dummy_baseline": 53.5,
+    "n_samples": 709,
+    "n_features": 32,
+    "warnings": 2
   }
 ]

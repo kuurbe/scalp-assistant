@@ -22,9 +22,14 @@ def compute_price_targets(
     if atr is None or atr <= 0:
         atr = current_price * 0.02  # fallback 2%
 
+    # Minimum stop/target distance — guards against degenerate levels where
+    # nearest_support/resistance is the current bar itself (stop == entry bug)
+    min_stop_dist = max(atr * 0.5, current_price * 0.003)   # at least 0.5 ATR or 0.3%
+    min_tgt_dist  = max(atr * 1.0, current_price * 0.005)   # at least 1 ATR or 0.5%
+
     if direction == "LONG":
-        stop = nearest_s if nearest_s else current_price - atr * 1.5
-        conservative = nearest_r if nearest_r else current_price + atr * 2.0
+        stop = nearest_s if (nearest_s and (current_price - nearest_s) >= min_stop_dist) else current_price - atr * 1.5
+        conservative = nearest_r if (nearest_r and (nearest_r - current_price) >= min_tgt_dist) else current_price + atr * 2.0
         aggressive = current_price + atr * 3.0
 
         # Use GBM median if available
@@ -33,8 +38,8 @@ def compute_price_targets(
             if gbm_target > current_price:
                 aggressive = max(aggressive, gbm_target)
     else:
-        stop = nearest_r if nearest_r else current_price + atr * 1.5
-        conservative = nearest_s if nearest_s else current_price - atr * 2.0
+        stop = nearest_r if (nearest_r and (nearest_r - current_price) >= min_stop_dist) else current_price + atr * 1.5
+        conservative = nearest_s if (nearest_s and (current_price - nearest_s) >= min_tgt_dist) else current_price - atr * 2.0
         aggressive = current_price - atr * 3.0
 
         if gbm_result and gbm_result.get("median_final_price"):

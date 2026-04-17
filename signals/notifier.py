@@ -2,8 +2,11 @@
 Push notification system — dispatches alerts to Telegram, Discord, macOS, and email.
 All functions fail silently (log at debug level) to avoid crashing the scanner.
 """
+import csv
+import datetime
 import logging
 import os
+import re
 import smtplib
 import subprocess
 
@@ -19,6 +22,112 @@ from signals.notification_config import (
 from signals.event_cards import format_event_card_text
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────
+#  Telegram alert persistence
+# ─────────────────────────────────────────────────────────────
+_TELEGRAM_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+_TELEGRAM_LOG_FILE = os.path.join(_TELEGRAM_LOG_DIR, "telegram_alerts.csv")
+_TELEGRAM_LOG_FIELDS = [
+    "timestamp", "channel", "ticker", "alert_type", "status", "message",
+]
+# Regex used to pull a ticker out of the alert text. Picks up tokens that
+# look like a ticker (1-5 uppercase letters, optionally with -USD).
+_TICKER_RE = re.compile(r"\b([A-Z]{1,5}(?:-USD)?)\b")
+# Pattern that prefers a ticker right after an em-dash or hyphen, which is
+# the format the scanner uses: "CALL — NVDA", "SCALP — AMD", "EVENT — Polymarket".
+_TICKER_AFTER_DASH = re.compile(r"[—\-]\s+([A-Z]{1,5}(?:-USD)?)\b")
+# Loose alert-type detection — order matters (most specific first).
+_ALERT_TYPE_KEYWORDS = [
+    ("OPTIONS_SCALP", ["options scalp", "scalp call", "scalp put"]),
+    ("CALL",          ["🟢", "call —", "buy call", "atm call"]),
+    ("PUT",           ["🔴", "put —",  "buy put",  "atm put"]),
+    ("CRYPTO",        ["btc", "eth", "sol", "crypto"]),
+    ("SWING",         ["swing"]),
+    ("INVESTMENT",    ["investment"]),
+    ("EVENT_CARD",    ["event", "polymarket", "kalshi"]),
+    ("INTEL",         ["intel", "geopolitical", "political"]),
+]
+
+
+_TICKER_BLACKLIST = {
+    "ACT", "NOW", "NEW", "THE", "AND", "FOR", "BUY", "SELL", "WITH", "FROM",
+    "CALL", "PUT", "ITM", "OTM", "ATM", "VIX", "ET", "PT", "CT", "EST",
+    "RSI", "MACD", "EMA", "SMA", "VWAP", "ORB", "BB", "OI", "IV", "RV",
+    "EOD", "DTE", "USD", "WIN", "LOSS", "PNL", "P", "L", "RR", "PCR",
+    "SCALP", "ALERT", "EVENT", "PHOTO", "CRYPTO", "STOCK", "ETF", "FED",
+    "BUYS", "SELLS", "TRADE", "TRADES", "PLAY", "PLAYS", "SETUP", "EXIT",
+    "ENTRY", "STOP", "TARGET", "OPTIONS", "OPTION", "BREAKOUT", "RECLAIM",
+    "SWING", "INVEST", "DAY", "WEEK", "MONTH", "YEAR", "GAIN", "LOSS",
+    "BIG", "BAD", "BULL", "BEAR", "HIGH", "LOW", "OPEN", "CLOSE", "TOP",
+    "BOT", "BOTS", "LONG", "SHORT", "FLAT", "OK", "NA", "FYI", "TBD",
+}
+
+
+def _extract_ticker(message: str) -> str:
+    """Best-effort ticker extraction from alert text.
+
+    Strategy:
+      1. Strip HTML tags
+      2. Try the "after-dash" pattern first: "CALL — NVDA" → NVDA
+      3. Fall back to first non-blacklisted uppercase token
+      4. Prefer -USD tokens (crypto) when present anywhere
+    """
+    if not message:
+        return ""
+    plain = re.sub(r"<[^>]+>", " ", message)
+
+    # Crypto pairs win — they're unambiguous
+    crypto = re.search(r"\b([A-Z]{2,5}-USD)\b", plain)
+    if crypto:
+        return crypto.group(1)
+
+    # Try after-dash pattern (most reliable for the scanner's format)
+    after_dash = _TICKER_AFTER_DASH.findall(plain)
+    for m in after_dash:
+        if m not in _TICKER_BLACKLIST and len(m) >= 2:
+            return m
+
+    # Fall back to scanning all uppercase tokens
+    for m in _TICKER_RE.findall(plain):
+        if m not in _TICKER_BLACKLIST and len(m) >= 2:
+            return m
+    return ""
+
+
+def _classify_alert(message: str) -> str:
+    """Best-effort alert-type classification."""
+    if not message:
+        return "UNKNOWN"
+    low = message.lower()
+    for label, keywords in _ALERT_TYPE_KEYWORDS:
+        if any(k in low for k in keywords):
+            return label
+    return "OTHER"
+
+
+def _log_telegram_alert(message: str, channel: str, status: str) -> None:
+    """Append a row to logs/telegram_alerts.csv. Never raises."""
+    try:
+        os.makedirs(_TELEGRAM_LOG_DIR, exist_ok=True)
+        new_file = not os.path.exists(_TELEGRAM_LOG_FILE)
+        with open(_TELEGRAM_LOG_FILE, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=_TELEGRAM_LOG_FIELDS)
+            if new_file:
+                writer.writeheader()
+            # Keep message field bounded so the CSV stays grep-friendly.
+            msg_clean = re.sub(r"\s+", " ", message or "").strip()[:500]
+            writer.writerow({
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "channel": channel,
+                "ticker": _extract_ticker(message),
+                "alert_type": _classify_alert(message),
+                "status": status,
+                "message": msg_clean,
+            })
+    except Exception:
+        logger.debug("Failed to log telegram alert", exc_info=True)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -51,6 +160,7 @@ def send_telegram(message: str, bot_token: str = None, chat_id: str = None) -> b
 
         if not token or not cid:
             logger.debug("Telegram not configured (missing bot_token or chat_id)")
+            _log_telegram_alert(message, channel=str(cid or "unset"), status="UNCONFIGURED")
             return False
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -64,13 +174,16 @@ def send_telegram(message: str, bot_token: str = None, chat_id: str = None) -> b
         resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code == 200:
             logger.debug("Telegram message sent successfully")
+            _log_telegram_alert(message, channel=str(cid), status="SENT")
             return True
         else:
             logger.debug("Telegram API error: %s %s", resp.status_code, resp.text[:200])
+            _log_telegram_alert(message, channel=str(cid), status=f"ERROR_{resp.status_code}")
             return False
 
     except Exception:
         logger.debug("Failed to send Telegram message", exc_info=True)
+        _log_telegram_alert(message, channel=str(chat_id or "unknown"), status="EXCEPTION")
         return False
 
 
@@ -89,15 +202,23 @@ def send_telegram_photo(photo_bytes: bytes, caption: str = "", bot_token: str = 
         else:
             token = get_secret("TELEGRAM_BOT_TOKEN", "")
         if not token or not cid:
+            _log_telegram_alert(f"[PHOTO] {caption}", channel=str(cid or "unset"), status="UNCONFIGURED")
             return False
 
         url = f"https://api.telegram.org/bot{token}/sendPhoto"
         files = {"photo": ("chart.png", photo_bytes, "image/png")}
         data = {"chat_id": cid, "caption": caption[:1024], "parse_mode": "HTML"}
         resp = requests.post(url, files=files, data=data, timeout=15)
-        return resp.status_code == 200
+        ok = resp.status_code == 200
+        _log_telegram_alert(
+            f"[PHOTO] {caption}",
+            channel=str(cid),
+            status="SENT" if ok else f"ERROR_{resp.status_code}",
+        )
+        return ok
     except Exception:
         logger.debug("Failed to send Telegram photo", exc_info=True)
+        _log_telegram_alert(f"[PHOTO] {caption}", channel=str(chat_id or "unknown"), status="EXCEPTION")
         return False
 
 
