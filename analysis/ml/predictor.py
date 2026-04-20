@@ -32,6 +32,68 @@ from config import settings
 # is no cross-ticker confusion.
 PERTICKER_UNIVERSE = ["SPY", "QQQ", "NVDA", "AAPL", "TSLA"]
 
+# ── Sector identity map for pooled model ─────────────────────────────────────
+# Maps each pooled universe ticker to its GICS sector bucket.
+# AMZN is dual-listed (TECH + CONSUMER_DISC); TECH takes priority here.
+_SECTOR_MAP: dict[str, str] = {
+    # TECH
+    "AAPL": "TECH", "MSFT": "TECH", "NVDA": "TECH", "AMD": "TECH",
+    "META": "TECH", "GOOG": "TECH", "GOOGL": "TECH", "AMZN": "TECH",
+    "QQQ": "TECH", "XLK": "TECH",
+    # FINANCE
+    "JPM": "FINANCE", "GS": "FINANCE", "BAC": "FINANCE", "XLF": "FINANCE",
+    # ENERGY
+    "XLE": "ENERGY", "CVX": "ENERGY", "XOM": "ENERGY",
+    # HEALTH
+    "JNJ": "HEALTH", "UNH": "HEALTH", "XLV": "HEALTH",
+    # CONSUMER_DISC
+    "TSLA": "CONSUMER_DISC", "XLY": "CONSUMER_DISC",
+    # CONSUMER_STAPLE
+    "WMT": "CONSUMER_STAPLE", "XLP": "CONSUMER_STAPLE",
+    # INDUSTRIAL
+    "XLI": "INDUSTRIAL", "CAT": "INDUSTRIAL",
+    # BROAD_MARKET
+    "SPY": "BROAD_MARKET", "IWM": "BROAD_MARKET", "DIA": "BROAD_MARKET",
+    "EEM": "BROAD_MARKET",
+    # UTILITIES (catch-all for XLU which is in pooled universe)
+    "XLU": "BROAD_MARKET", "XLB": "INDUSTRIAL",
+}
+
+# Fixed estimated beta per ticker for the pooled model
+_BETA_MAP: dict[str, float] = {
+    # Broad market
+    "SPY": 1.0, "IWM": 1.0, "DIA": 1.0, "EEM": 1.0,
+    # High-beta tech
+    "QQQ": 1.35, "XLK": 1.35, "NVDA": 1.35, "AMD": 1.35,
+    "META": 1.35, "GOOG": 1.35, "GOOGL": 1.35, "AAPL": 1.35, "MSFT": 1.35,
+    # Consumer discretionary high-beta
+    "TSLA": 1.4, "AMZN": 1.4, "XLY": 1.4,
+    # Finance
+    "XLF": 1.1, "JPM": 1.1, "GS": 1.1, "BAC": 1.1,
+    # Energy / Industrial
+    "XLE": 0.9, "CVX": 0.9, "XOM": 0.9, "XLI": 0.9, "CAT": 0.9, "XLB": 0.9,
+    # Defensive
+    "XLV": 0.65, "JNJ": 0.65, "UNH": 0.65,
+    "XLP": 0.65, "WMT": 0.65, "XLU": 0.65,
+}
+
+# ── Pooled model extra feature columns ───────────────────────────────────────
+# These are added ONLY for the pooled universal model.  Per-ticker models use
+# _perticker_feature_cols() which is unaffected.
+POOLED_EXTRA_COLS: list[str] = [
+    # Sector one-hot (8 buckets)
+    "sec_tech", "sec_finance", "sec_energy", "sec_health",
+    "sec_cons_disc", "sec_cons_staple", "sec_industrial", "sec_broad",
+    # Fixed beta
+    "beta_vs_spy",
+    # Cross-sectional rank features (per-ticker-per-date, genuinely discriminative)
+    "cs_rank_ret5d", "cs_rank_ret20d", "cs_rank_rsi", "cs_rank_vol_ratio",
+]
+
+# Full feature list used when training / predicting with the universal pooled model.
+# The per-ticker path uses _perticker_feature_cols() instead.
+POOLED_FEATURE_COLS: list[str] = FEATURE_COLS + POOLED_EXTRA_COLS
+
 
 # Hyperparameter search space — small deliberately-curated grid, not exhaustive.
 # Each candidate represents a different bias/variance tradeoff so walk-forward
@@ -131,15 +193,132 @@ def _universal_training_universe() -> list[str]:
     ]
 
 
+def _add_sector_features(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Add sector one-hot columns and a fixed beta estimate to *df* in-place.
+
+    Adds 8 binary columns (sec_tech, sec_finance, sec_energy, sec_health,
+    sec_cons_disc, sec_cons_staple, sec_industrial, sec_broad) and one
+    continuous column (beta_vs_spy).  All sector columns default to 0; the
+    column matching the ticker's sector is set to 1.0.
+    """
+    sector_cols = {
+        "TECH":           "sec_tech",
+        "FINANCE":        "sec_finance",
+        "ENERGY":         "sec_energy",
+        "HEALTH":         "sec_health",
+        "CONSUMER_DISC":  "sec_cons_disc",
+        "CONSUMER_STAPLE": "sec_cons_staple",
+        "INDUSTRIAL":     "sec_industrial",
+        "BROAD_MARKET":   "sec_broad",
+    }
+    # Initialise all sector columns to 0
+    for col in sector_cols.values():
+        df[col] = 0.0
+
+    # Set the appropriate sector column to 1
+    sector = _SECTOR_MAP.get(ticker.upper(), "BROAD_MARKET")
+    df[sector_cols[sector]] = 1.0
+
+    # Fixed beta estimate
+    df["beta_vs_spy"] = _BETA_MAP.get(ticker.upper(), 1.0)
+
+    return df
+
+
+def _add_cross_sectional_features(
+    all_ticker_data: dict[str, pd.DataFrame],
+    ticker: str,
+) -> pd.DataFrame:
+    """Add cross-sectional rank features to the DataFrame for *ticker*.
+
+    For each date, ranks this ticker's value among all tickers in
+    *all_ticker_data* using percentile rank (0.0 = lowest, 1.0 = highest).
+    Dates where fewer than 10 tickers have data are left as NaN —
+    HistGradientBoosting handles NaN natively.
+
+    Computes:
+      cs_rank_ret5d    — rank of 5-day return
+      cs_rank_ret20d   — rank of 20-day return
+      cs_rank_rsi      — rank of RSI_14
+      cs_rank_vol_ratio — rank of today's volume / 20d avg volume
+
+    Returns the ticker's DataFrame with 4 new columns added.
+    """
+    df_target = all_ticker_data[ticker].copy()
+
+    # Helper: build a date-indexed Series for a derived metric across all tickers
+    def _build_panel(metric_fn) -> pd.DataFrame:
+        """Returns a DataFrame indexed by date, one column per ticker."""
+        cols = {}
+        for sym, df_sym in all_ticker_data.items():
+            try:
+                cols[sym] = metric_fn(df_sym)
+            except Exception:
+                pass
+        return pd.DataFrame(cols)
+
+    # Metric extractors — each returns a date-indexed Series
+    def _ret5d(df: pd.DataFrame) -> pd.Series:
+        return df["Close"].pct_change(5) * 100
+
+    def _ret20d(df: pd.DataFrame) -> pd.Series:
+        return df["Close"].pct_change(20) * 100
+
+    def _rsi(df: pd.DataFrame) -> pd.Series:
+        # Use pre-built rsi_14 column if available, else compute on-the-fly
+        if "rsi_14" in df.columns:
+            return df["rsi_14"]
+        # Simple RSI fallback (Wilder smoothing, window=14)
+        delta = df["Close"].diff()
+        gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        return 100 - (100 / (1 + rs))
+
+    def _vol_ratio(df: pd.DataFrame) -> pd.Series:
+        vol = df["Volume"].astype(float)
+        avg20 = vol.rolling(20, min_periods=10).mean()
+        return vol / avg20.replace(0, np.nan)
+
+    min_tickers = 10
+
+    for col_name, metric_fn in [
+        ("cs_rank_ret5d",    _ret5d),
+        ("cs_rank_ret20d",   _ret20d),
+        ("cs_rank_rsi",      _rsi),
+        ("cs_rank_vol_ratio", _vol_ratio),
+    ]:
+        try:
+            panel = _build_panel(metric_fn)
+            # Only keep dates where >= min_tickers have non-NaN values
+            valid_mask = panel.notna().sum(axis=1) >= min_tickers
+            # pct_rank across the row (axis=1) → value for our ticker
+            ranks = panel.rank(axis=1, pct=True)
+            ticker_rank = ranks[ticker].where(valid_mask)
+            # Align to df_target's index
+            df_target[col_name] = ticker_rank.reindex(df_target.index)
+        except Exception as e:
+            logger.debug(
+                "_add_cross_sectional_features(%s, %s): %s", ticker, col_name, e
+            )
+            df_target[col_name] = np.nan
+
+    return df_target
+
+
 def _fetch_pooled_training_data(tickers: list[str], lookback_days: int) -> pd.DataFrame:
     """Fetch OHLCV for each ticker, build features, stack into one DataFrame.
 
     Each row carries a '_ticker' column so we can do cross-instrument walk-forward.
-    Returns a single DataFrame indexed by (ticker, date).
+    Adds sector identity features (one-hot + beta) and cross-sectional rank
+    features to each ticker's DataFrame before concatenating.
+
+    Returns a single DataFrame indexed by date, with POOLED_FEATURE_COLS available.
     """
     from data.fetchers.yfinance_fetcher import safe_yf_download
 
-    frames = []
+    # ── Pass 1: fetch and build base features for each ticker ─────────────────
+    ticker_dfs: dict[str, pd.DataFrame] = {}
     for sym in tickers:
         try:
             df = safe_yf_download(sym, period=f"{lookback_days}d", interval="1d")
@@ -150,13 +329,29 @@ def _fetch_pooled_training_data(tickers: list[str], lookback_days: int) -> pd.Da
             feat = build_features(df).copy()
             feat["target_ret"] = feat["Close"].pct_change().shift(-1) * 100
             feat["_ticker"] = sym
-            frames.append(feat)
+            # Sector identity features can be added immediately (constant per ticker)
+            feat = _add_sector_features(feat, sym)
+            ticker_dfs[sym] = feat
         except Exception as e:
             logger.debug("pooled training: %s fetch failed: %s", sym, e)
             continue
 
-    if not frames:
+    if not ticker_dfs:
         return pd.DataFrame()
+
+    # ── Pass 2: cross-sectional rank features (require all tickers) ───────────
+    frames = []
+    for sym, feat in ticker_dfs.items():
+        try:
+            feat = _add_cross_sectional_features(ticker_dfs, sym)
+        except Exception as e:
+            logger.debug("pooled training: %s cross-sectional failed: %s", sym, e)
+            # Add NaN columns so the schema stays consistent
+            for col in ["cs_rank_ret5d", "cs_rank_ret20d", "cs_rank_rsi", "cs_rank_vol_ratio"]:
+                if col not in feat.columns:
+                    feat[col] = np.nan
+        frames.append(feat)
+
     return pd.concat(frames, axis=0).sort_index()
 
 
@@ -207,12 +402,26 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
         except Exception:
             pass
 
-    clean = featured.dropna(subset=FEATURE_COLS + ["target_ret"])
+    # For the universal pooled model use POOLED_FEATURE_COLS (base + sector +
+    # cross-sectional ranks).  Per-ticker / named-ticker training uses FEATURE_COLS.
+    active_feature_cols = POOLED_FEATURE_COLS if ticker == "universal" else FEATURE_COLS
+
+    # For pooled model, cross-sectional rank columns may be NaN on sparse dates;
+    # HistGBM handles NaN natively so we only require base FEATURE_COLS to be
+    # non-NaN when dropping rows.  Sector/beta columns are always populated.
+    required_cols = FEATURE_COLS if ticker == "universal" else active_feature_cols
+    clean = featured.dropna(subset=required_cols + ["target_ret"])
 
     if len(clean) < 80:
         return {"error": f"Only {len(clean)} valid rows — need 80+ for walk-forward"}
 
-    X = clean[FEATURE_COLS].values
+    # Ensure all active feature columns exist (fill missing with 0.0 for safety)
+    for col in active_feature_cols:
+        if col not in clean.columns:
+            clean = clean.copy()
+            clean[col] = 0.0
+
+    X = clean[active_feature_cols].values
     y_ret = clean["target_ret"].values
     y_dir = clean["target_dir"].values
     dates = clean.index
@@ -363,8 +572,8 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
         avg_imp = perm.importances_mean
     except Exception as e:
         logger.warning("permutation_importance failed: %s — using zeros", e)
-        avg_imp = np.zeros(len(FEATURE_COLS))
-    importances = dict(zip(FEATURE_COLS, avg_imp))
+        avg_imp = np.zeros(len(active_feature_cols))
+    importances = dict(zip(active_feature_cols, avg_imp))
 
     # Warn about features with near-zero or negative importance — they add noise
     low_importance = [k for k, v in importances.items() if v <= 0.001]
@@ -384,7 +593,8 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
         "dummy_baseline": round(dummy_hit, 1),
         "edge_vs_dummy": round(wf_hit_rate - dummy_hit, 1),
         "class_balance": round(class_balance, 3),
-        "n_features": len(FEATURE_COLS),
+        "n_features": len(active_feature_cols),
+        "feature_names": active_feature_cols,
         "n_samples": len(clean),
         "sharpe": round(sharpe, 3),                       # strategy Sharpe now
         "strategy_mean_pct": round(strategy_mean_bp, 4),  # mean per-trade %
@@ -926,16 +1136,19 @@ def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "univ
         # Resolve metadata for the active model
         meta = perticker_meta if perticker_meta is not None else _get_cached_meta(effective_model)
 
-        # Feature version check — prevent crash if model was trained with different features
-        # For per-ticker models the feature list lives in meta["feature_names"]; for the
-        # universal model it matches FEATURE_COLS exactly.
+        # Feature version check — prevent crash if model was trained with different features.
+        # Universal model stores feature_names in meta after retraining.  We accept both
+        # old FEATURE_COLS-count models and new POOLED_FEATURE_COLS-count models; any
+        # other count is a sign of stale artifacts that need retraining.
         if effective_model == "universal":
             model_n_features = meta.get("n_features", 0)
-            if model_n_features and model_n_features != len(FEATURE_COLS):
+            if model_n_features and model_n_features not in (
+                len(FEATURE_COLS), len(POOLED_FEATURE_COLS)
+            ):
                 logger.warning(
-                    "Feature mismatch: model expects %d features, code has %d. "
-                    "Run auto_retrain to update the model.",
-                    model_n_features, len(FEATURE_COLS),
+                    "Feature mismatch: model expects %d features, code has %d (base) "
+                    "or %d (pooled). Run auto_retrain to update the model.",
+                    model_n_features, len(FEATURE_COLS), len(POOLED_FEATURE_COLS),
                 )
                 return _empty_prediction()
 
@@ -951,19 +1164,37 @@ def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "univ
         # Build features (reuse pre-built if provided)
         featured = featured_df if featured_df is not None else build_features(df)
 
-        # ── Feature alignment for per-ticker models ───────────────────────────
-        # Per-ticker models may have been trained on a superset of FEATURE_COLS
-        # (adding regime/calendar features). We need to supply exactly the feature
-        # columns the model was trained on. If a column is missing at prediction
-        # time we fill with 0 (safe default for all our binary/z-score features).
-        if effective_model != "universal" and meta.get("feature_names"):
+        # ── Feature alignment ─────────────────────────────────────────────────
+        # Per-ticker models: trained_features lives in meta["feature_names"].
+        # Universal model: use meta["feature_names"] if present (post-retrain),
+        #   otherwise fall back to POOLED_FEATURE_COLS.
+        # For all cases, any missing column is filled with 0.0 (safe default for
+        # binary/z-score features; sector columns and beta will also be 0 if the
+        # model is stale — acceptable until next retrain).
+        if meta.get("feature_names"):
+            # Prefer the stored feature list (works for both per-ticker and universal)
             trained_features = meta["feature_names"]
-            for col in trained_features:
-                if col not in featured.columns:
-                    featured[col] = 0.0
-            latest = featured[trained_features].iloc[-1:]
+        elif effective_model == "universal":
+            # Old universal model (pre-sector features): fall back to FEATURE_COLS
+            # so we don't pass 31 columns to a model trained on 18.
+            n_saved = meta.get("n_features", 0)
+            trained_features = POOLED_FEATURE_COLS if n_saved == len(POOLED_FEATURE_COLS) else FEATURE_COLS
         else:
-            latest = featured[FEATURE_COLS].iloc[-1:]
+            trained_features = FEATURE_COLS
+
+        for col in trained_features:
+            if col not in featured.columns:
+                featured[col] = 0.0
+        latest = featured[trained_features].iloc[-1:].copy()
+
+        # For the universal model, inject sector identity and fill any remaining
+        # NaN in pooled-only columns.  Sector one-hot defaults to 0 (unknown
+        # sector), beta defaults to 1.0 (market-neutral).
+        if effective_model == "universal" and "sec_tech" in trained_features:
+            latest = _add_sector_features(latest, ticker)
+        for col in POOLED_EXTRA_COLS:
+            if col in latest.columns and pd.isna(latest[col].iloc[0]):
+                latest[col] = 1.0 if col == "beta_vs_spy" else 0.0
 
         if latest.isna().any(axis=1).iloc[0]:
             return _empty_prediction()
