@@ -27,9 +27,11 @@ for ticker, meta in results.items():
     if "error" in meta:
         print(f"  {ticker}: ERROR — {meta['error']}")
     else:
+        edge = meta.get('edge_vs_dummy', '?')
+        edge_str = f"{edge:+.2f}pp" if isinstance(edge, (int, float)) else f"{edge}pp"
         print(
             f"  {ticker}: hit_rate={meta.get('hit_rate', '?')}%  "
-            f"edge={meta.get('edge_vs_dummy', '?'):+}pp  "
+            f"edge={edge_str}  "
             f"n={meta.get('n_samples', '?')}  "
             f"hp={meta.get('best_hp_tag', '?')}"
         )
