@@ -26,6 +26,12 @@ from sklearn.model_selection import TimeSeriesSplit
 from analysis.ml.feature_engine import build_features, FEATURE_COLS, build_forecast
 from config import settings
 
+# ── Per-ticker specialized model universe ────────────────────────────────────
+# These tickers get their own models trained on single-symbol data plus regime
+# features (VIX z-score, SPY trend, calendar) that become meaningful when there
+# is no cross-ticker confusion.
+PERTICKER_UNIVERSE = ["SPY", "QQQ", "NVDA", "AAPL", "TSLA"]
+
 
 # Hyperparameter search space — small deliberately-curated grid, not exhaustive.
 # Each candidate represents a different bias/variance tradeoff so walk-forward
@@ -425,6 +431,404 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
     }
 
 
+# ── PER-TICKER TRAINING ──────────────────────────────────────────────────────
+
+def _fetch_perticker_training_data(ticker: str) -> "pd.DataFrame | None":
+    """Fetch 3 years of daily data for a single ticker and build augmented features.
+
+    Beyond the standard OHLCV-derived FEATURE_COLS this adds:
+      - vix_z20          : VIX 20-day z-score
+      - vix_regime       : 1 if VIX > 20, else 0
+      - spy_ret_20d      : SPY 20-day return (omitted for SPY itself)
+      - spy_trend_up     : 1 if SPY > SPY 50d SMA (always present, even for SPY)
+      - dow              : day of week (0=Mon)
+      - dom              : day of month
+      - is_month_end     : binary
+      - is_month_start   : binary
+      - is_quarter_end   : binary
+      - rs_vs_spy_5d     : ticker 5d return minus SPY 5d return (omitted for SPY)
+      - rs_vs_spy_20d    : ticker 20d return minus SPY 20d return (omitted for SPY)
+
+    Returns a DataFrame with all features plus target_clf and target_reg columns,
+    or None if there is insufficient data.
+    """
+    from data.fetchers.yfinance_fetcher import safe_yf_download
+
+    LOOKBACK = "1095d"  # ~3 years
+
+    # ── Fetch ticker OHLCV ──
+    try:
+        df = safe_yf_download(ticker, period=LOOKBACK, interval="1d")
+        if df is None or len(df) < 100:
+            logger.warning("_fetch_perticker_training_data(%s): insufficient data (%s rows)",
+                           ticker, len(df) if df is not None else 0)
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+    except Exception as e:
+        logger.warning("_fetch_perticker_training_data(%s): fetch failed: %s", ticker, e)
+        return None
+
+    # ── Build base features ──
+    try:
+        feat = build_features(df).copy()
+    except Exception as e:
+        logger.warning("_fetch_perticker_training_data(%s): build_features failed: %s", ticker, e)
+        return None
+
+    # ── Targets ──
+    feat["target_ret"] = feat["Close"].pct_change().shift(-1) * 100
+    feat["target_clf"] = (feat["target_ret"] > 0.25).astype(int)
+    feat["target_reg"] = feat["target_ret"]
+
+    # ── Calendar features (always safe, no external data needed) ──
+    idx = feat.index
+    feat["dow"] = idx.dayofweek.astype(float)
+    feat["dom"] = idx.day.astype(float)
+    feat["is_month_end"] = idx.is_month_end.astype(float)
+    feat["is_month_start"] = idx.is_month_start.astype(float)
+    feat["is_quarter_end"] = idx.is_quarter_end.astype(float)
+
+    # ── VIX regime features (graceful degradation if fetch fails) ──
+    try:
+        vix_df = safe_yf_download("^VIX", period=LOOKBACK, interval="1d")
+        if vix_df is not None and len(vix_df) >= 30:
+            if isinstance(vix_df.columns, pd.MultiIndex):
+                vix_df.columns = vix_df.columns.get_level_values(0)
+            vix_close = vix_df["Close"].reindex(feat.index).ffill()
+            vix_roll_mean = vix_close.rolling(20, min_periods=10).mean()
+            vix_roll_std = vix_close.rolling(20, min_periods=10).std().replace(0, np.nan)
+            feat["vix_z20"] = ((vix_close - vix_roll_mean) / vix_roll_std).fillna(0.0)
+            feat["vix_regime"] = (vix_close > 20).astype(float).fillna(0.0)
+        else:
+            feat["vix_z20"] = 0.0
+            feat["vix_regime"] = 0.0
+    except Exception as e:
+        logger.debug("_fetch_perticker_training_data(%s): VIX fetch failed (%s), using defaults", ticker, e)
+        feat["vix_z20"] = 0.0
+        feat["vix_regime"] = 0.0
+
+    # ── SPY-relative features (skip for SPY itself to avoid zero/redundant signals) ──
+    if ticker != "SPY":
+        try:
+            spy_df = safe_yf_download("SPY", period=LOOKBACK, interval="1d")
+            if spy_df is not None and len(spy_df) >= 60:
+                if isinstance(spy_df.columns, pd.MultiIndex):
+                    spy_df.columns = spy_df.columns.get_level_values(0)
+                spy_close = spy_df["Close"].reindex(feat.index).ffill()
+                spy_sma50 = spy_close.rolling(50, min_periods=20).mean()
+                feat["spy_ret_20d"] = spy_close.pct_change(20).fillna(0.0) * 100
+                feat["spy_trend_up"] = (spy_close > spy_sma50).astype(float).fillna(0.0)
+                # Relative strength vs SPY
+                ticker_close = feat["Close"].astype(float)
+                feat["rs_vs_spy_5d"] = (
+                    ticker_close.pct_change(5).fillna(0.0) * 100
+                    - spy_close.pct_change(5).fillna(0.0) * 100
+                )
+                feat["rs_vs_spy_20d"] = (
+                    ticker_close.pct_change(20).fillna(0.0) * 100
+                    - spy_close.pct_change(20).fillna(0.0) * 100
+                )
+            else:
+                feat["spy_ret_20d"] = 0.0
+                feat["spy_trend_up"] = 0.0
+                feat["rs_vs_spy_5d"] = 0.0
+                feat["rs_vs_spy_20d"] = 0.0
+        except Exception as e:
+            logger.debug("_fetch_perticker_training_data(%s): SPY fetch failed (%s), using defaults", ticker, e)
+            feat["spy_ret_20d"] = 0.0
+            feat["spy_trend_up"] = 0.0
+            feat["rs_vs_spy_5d"] = 0.0
+            feat["rs_vs_spy_20d"] = 0.0
+    else:
+        # For SPY: only add spy_trend_up (SPY vs its own SMA — still informative)
+        try:
+            spy_close = feat["Close"].astype(float)
+            spy_sma50 = spy_close.rolling(50, min_periods=20).mean()
+            feat["spy_trend_up"] = (spy_close > spy_sma50).astype(float).fillna(0.0)
+        except Exception:
+            feat["spy_trend_up"] = 0.0
+
+    feat["_ticker"] = ticker
+    return feat
+
+
+def _perticker_feature_cols(ticker: str) -> list[str]:
+    """Return the ordered feature column list for a per-ticker model.
+
+    Extends FEATURE_COLS with regime/calendar features that are only
+    informative for single-ticker models.
+    """
+    extra = [
+        "vix_z20", "vix_regime",
+        "spy_trend_up",
+        "dow", "dom",
+        "is_month_end", "is_month_start", "is_quarter_end",
+    ]
+    if ticker != "SPY":
+        extra += ["spy_ret_20d", "rs_vs_spy_5d", "rs_vs_spy_20d"]
+    return FEATURE_COLS + extra
+
+
+def train_per_ticker_models(ticker: str, force: bool = False) -> dict:
+    """Train per-ticker specialized GBM models for a single ticker.
+
+    Uses the SAME walk-forward evaluation and HP search as the universal model.
+    Saves four artifacts to models/:
+      - gbm_clf_{ticker.lower()}.joblib
+      - gbm_reg_{ticker.lower()}.joblib
+      - scaler_{ticker.lower()}.joblib
+      - meta_{ticker.lower()}.json
+
+    Args:
+        ticker: Must be in PERTICKER_UNIVERSE (or any ticker — the guard is a
+                convention, not enforced here).
+        force:  If True, retrain even if artifacts already exist.
+
+    Returns:
+        Meta dict (same keys as train_model() returns + ticker/feature_names/
+        training_period).  On failure returns {"error": ...}.
+    """
+    tag = ticker.lower()
+    clf_file = _model_path(tag, "clf")
+    reg_file = _model_path(tag, "reg")
+    scaler_file = _scaler_path(tag)
+    meta_file = _meta_path(tag)
+
+    # Load existing unless forced
+    if not force and os.path.exists(clf_file) and os.path.exists(meta_file):
+        try:
+            with open(meta_file) as f:
+                meta = json.load(f)
+            logger.info("train_per_ticker_models(%s): loaded existing model (hit_rate=%.1f%%)",
+                        ticker, meta.get("hit_rate", 0))
+            return meta
+        except Exception:
+            pass  # fall through to retrain
+
+    logger.info("train_per_ticker_models(%s): fetching training data …", ticker)
+    featured = _fetch_perticker_training_data(ticker)
+    if featured is None:
+        return {"error": f"No training data for {ticker}"}
+
+    feature_cols = _perticker_feature_cols(ticker)
+    # Drop any feature column that is entirely NaN or missing
+    available_features = [c for c in feature_cols if c in featured.columns
+                          and not featured[c].isna().all()]
+    if len(available_features) < len(FEATURE_COLS):
+        logger.warning(
+            "train_per_ticker_models(%s): only %d/%d feature columns available",
+            ticker, len(available_features), len(feature_cols),
+        )
+
+    clean = featured.dropna(subset=available_features + ["target_clf", "target_reg"])
+    if len(clean) < 80:
+        return {"error": f"Only {len(clean)} valid rows for {ticker} — need 80+"}
+
+    X = clean[available_features].values
+    y_dir = clean["target_clf"].values
+    y_ret = clean["target_reg"].values
+    dates = clean.index
+
+    class_balance = float(np.mean(y_dir))
+    dummy_hit = max(class_balance, 1 - class_balance) * 100
+
+    # ── Walk-forward HP search (identical structure to train_model) ──
+    n_splits = 5
+    tscv = TimeSeriesSplit(n_splits=n_splits, gap=1)
+
+    def _wf_score(hp: dict):
+        folds = []
+        preds_ret, preds_dir, actual_ret, actual_dir = [], [], [], []
+        for fold_i, (train_idx, test_idx) in enumerate(tscv.split(X)):
+            scaler_fold = StandardScaler()
+            X_train = scaler_fold.fit_transform(X[train_idx])
+            X_test = scaler_fold.transform(X[test_idx])
+            y_ret_train, y_ret_test = y_ret[train_idx], y_ret[test_idx]
+            y_dir_train, y_dir_test = y_dir[train_idx], y_dir[test_idx]
+
+            reg = HistGradientBoostingRegressor(random_state=42, **hp)
+            reg.fit(X_train, y_ret_train)
+            r2_test_fold = reg.score(X_test, y_ret_test)
+            r2_train_fold = reg.score(X_train, y_ret_train)
+
+            clf = HistGradientBoostingClassifier(random_state=42, **hp)
+            clf.fit(X_train, y_dir_train)
+            hit_train = float(np.mean(clf.predict(X_train) == y_dir_train)) * 100
+            hit_test = float(np.mean(clf.predict(X_test) == y_dir_test)) * 100
+
+            preds_ret.extend(reg.predict(X_test))
+            preds_dir.extend(clf.predict(X_test))
+            actual_ret.extend(y_ret_test)
+            actual_dir.extend(y_dir_test)
+
+            folds.append({
+                "fold": fold_i + 1,
+                "train_size": len(train_idx),
+                "test_size": len(test_idx),
+                "date_range": (
+                    f"{dates[test_idx[0]].strftime('%Y-%m-%d')} → "
+                    f"{dates[test_idx[-1]].strftime('%Y-%m-%d')}"
+                ),
+                "r2_train": round(r2_train_fold, 4),
+                "r2_test": round(r2_test_fold, 4),
+                "hit_rate_train": round(hit_train, 1),
+                "hit_rate_test": round(hit_test, 1),
+            })
+        hit = float(np.mean(np.array(preds_dir) == np.array(actual_dir))) * 100
+        return hit - dummy_hit, folds, preds_ret, preds_dir, actual_ret, actual_dir
+
+    hp_results = []
+    for hp_tag, hp in _HP_CANDIDATES:
+        edge, folds, preds_ret, preds_dir, actual_ret, actual_dir = _wf_score(hp)
+        hp_results.append({
+            "tag": hp_tag, "edge_vs_dummy": round(edge, 2), "hp": hp,
+            "folds": folds,
+            "preds_ret": preds_ret, "preds_dir": preds_dir,
+            "actual_ret": actual_ret, "actual_dir": actual_dir,
+        })
+        logger.info("  [%s] HP[%s]: edge_vs_dummy=%+.2fpp", ticker, hp_tag, edge)
+
+    best = max(hp_results, key=lambda r: r["edge_vs_dummy"])
+    logger.info("  [%s] Best HP: %s (edge=%+.2fpp)", ticker, best["tag"], best["edge_vs_dummy"])
+
+    fold_results = best["folds"]
+    all_preds_ret = np.array(best["preds_ret"])
+    all_preds_dir = np.array(best["preds_dir"])
+    all_actual_ret = np.array(best["actual_ret"])
+    all_actual_dir = np.array(best["actual_dir"])
+    best_hp = best["hp"]
+    best_hp_tag = best["tag"]
+
+    wf_hit_rate = float(np.mean(all_preds_dir == all_actual_dir)) * 100
+    ss_res = np.sum((all_actual_ret - all_preds_ret) ** 2)
+    ss_tot = np.sum((all_actual_ret - np.mean(all_actual_ret)) ** 2)
+    wf_r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    strategy_signals = all_preds_dir * 2 - 1
+    strategy_returns = strategy_signals * all_actual_ret
+    if np.std(strategy_returns) > 1e-8:
+        sharpe = float(np.mean(strategy_returns) / np.std(strategy_returns)) * np.sqrt(252)
+    else:
+        sharpe = 0.0
+    strategy_mean_bp = float(np.mean(strategy_returns))
+    strategy_std_bp = float(np.std(strategy_returns))
+
+    avg_r2_train = float(np.mean([f["r2_train"] for f in fold_results]))
+    avg_r2_test = float(np.mean([f["r2_test"] for f in fold_results]))
+    avg_hit_train = float(np.mean([f["hit_rate_train"] for f in fold_results]))
+
+    # ── Final model on all data ──
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    reg_model = HistGradientBoostingRegressor(random_state=42, **best_hp)
+    reg_model.fit(X_scaled, y_ret)
+
+    clf_model = HistGradientBoostingClassifier(random_state=42, **best_hp)
+    clf_model.fit(X_scaled, y_dir)
+
+    # Permutation importance
+    n_perm_samples = min(2000, len(X_scaled))
+    perm_idx = np.random.RandomState(42).choice(len(X_scaled), n_perm_samples, replace=False)
+    try:
+        from sklearn.inspection import permutation_importance as _perm_imp
+        perm = _perm_imp(
+            clf_model, X_scaled[perm_idx], y_dir[perm_idx],
+            n_repeats=3, random_state=42, n_jobs=1,
+        )
+        avg_imp = perm.importances_mean
+    except Exception:
+        avg_imp = np.zeros(len(available_features))
+    importances = dict(zip(available_features, avg_imp))
+
+    # ── Save artifacts ──
+    joblib.dump(reg_model, reg_file)
+    joblib.dump(clf_model, clf_file)
+    joblib.dump(scaler, scaler_file)
+
+    training_period = (
+        f"{dates[0].strftime('%Y-%m-%d')} → {dates[-1].strftime('%Y-%m-%d')}"
+    )
+
+    meta = {
+        "ticker": ticker,
+        "hit_rate": round(wf_hit_rate, 1),
+        "wf_hit_rate": round(wf_hit_rate, 1),
+        "wf_r2": round(wf_r2, 4),
+        "dummy_baseline": round(dummy_hit, 1),
+        "edge_vs_dummy": round(wf_hit_rate - dummy_hit, 1),
+        "class_balance": round(class_balance, 3),
+        "n_samples": len(clean),
+        "n_features": len(available_features),
+        "feature_names": available_features,
+        "sharpe": round(sharpe, 3),
+        "strategy_mean_pct": round(strategy_mean_bp, 4),
+        "strategy_std_pct": round(strategy_std_bp, 4),
+        "pred_mean": round(float(np.mean(all_preds_ret)), 4),
+        "pred_std": round(float(np.std(all_preds_ret)), 4),
+        "target_threshold_pct": 0.25,
+        "model_class": "HistGradientBoosting",
+        "best_hp_tag": best_hp_tag,
+        "best_hp": best_hp,
+        "training_period": training_period,
+        "hp_search_results": [
+            {"tag": r["tag"], "edge_vs_dummy": r["edge_vs_dummy"]}
+            for r in sorted(hp_results, key=lambda x: -x["edge_vs_dummy"])
+        ],
+    }
+    with open(meta_file, "w") as f:
+        json.dump(meta, f)
+
+    logger.info(
+        "train_per_ticker_models(%s): done — hit_rate=%.1f%%, edge=%+.1fpp, n=%d, period=%s",
+        ticker, wf_hit_rate, wf_hit_rate - dummy_hit, len(clean), training_period,
+    )
+    return {
+        "ticker": ticker,
+        "hit_rate": round(wf_hit_rate, 1),
+        "r2_train": round(avg_r2_train, 4),
+        "r2_test": round(wf_r2, 4),
+        "hit_rate_train": round(avg_hit_train, 1),
+        "hit_rate_test": round(wf_hit_rate, 1),
+        "dummy_baseline": round(dummy_hit, 1),
+        "edge_vs_dummy": round(wf_hit_rate - dummy_hit, 1),
+        "sharpe": round(sharpe, 3),
+        "strategy_mean_pct": round(strategy_mean_bp, 4),
+        "n_samples": len(clean),
+        "n_features": len(available_features),
+        "feature_names": available_features,
+        "best_hp_tag": best_hp_tag,
+        "best_hp": best_hp,
+        "training_period": training_period,
+        "hp_search_results": meta["hp_search_results"],
+        "fold_results": fold_results,
+        "feature_importances": {k: round(v, 4) for k, v in
+                                 sorted(importances.items(), key=lambda x: -x[1])},
+    }
+
+
+def train_all_per_ticker_models(force: bool = False) -> dict:
+    """Train per-ticker models for every ticker in PERTICKER_UNIVERSE.
+
+    Args:
+        force: If True, retrain even if models already exist.
+
+    Returns:
+        Dict mapping ticker -> meta dict (same shape as train_per_ticker_models).
+    """
+    results = {}
+    for ticker in PERTICKER_UNIVERSE:
+        logger.info("train_all_per_ticker_models: training %s …", ticker)
+        try:
+            meta = train_per_ticker_models(ticker, force=force)
+            results[ticker] = meta
+        except Exception as e:
+            logger.error("train_all_per_ticker_models: %s failed: %s", ticker, e)
+            results[ticker] = {"error": str(e)}
+    return results
+
+
 # ── TV LIVE BLENDING ────────────────────────────────────────────────────────
 
 # Mapping from TradingView indicator keys → feature column names
@@ -486,13 +890,32 @@ def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "univ
                    featured_df: pd.DataFrame = None, use_tv: bool = False) -> dict:
     """Generate ML prediction with drift detection and Sharpe-adjusted scoring.
 
+    Routing logic:
+      1. If a per-ticker model exists for ``ticker`` (e.g. models/gbm_clf_spy.joblib),
+         use it — it was trained with regime/calendar features and will be more
+         accurate for that specific instrument.
+      2. Otherwise fall back to the universal pooled model.
+
     Args:
         use_tv: If True, blend live TradingView values into features before prediction.
                 Only use for top-N picks (adds ~1-2s latency per call).
     """
     try:
+        # ── Per-ticker model routing ──────────────────────────────────────────
+        # Prefer the per-ticker model when it exists; fall back to universal.
+        # model_name may be overridden by the caller (e.g. "universal") — only
+        # auto-route when the default "universal" is requested so that explicit
+        # model_name= arguments are still respected.
+        effective_model = model_name
+        perticker_meta = None
+        if model_name == "universal" and ticker.upper() in PERTICKER_UNIVERSE:
+            pt_tag = ticker.lower()
+            if os.path.exists(_model_path(pt_tag, "clf")):
+                effective_model = pt_tag
+                perticker_meta = _get_cached_meta(pt_tag)
+
         # Load models (cached — single load for all tickers)
-        cached = _get_cached_models(model_name)
+        cached = _get_cached_models(effective_model)
         if cached is None:
             return _empty_prediction()
 
@@ -500,21 +923,26 @@ def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "univ
         clf_model = cached["clf"]
         scaler = cached["scaler"]
 
+        # Resolve metadata for the active model
+        meta = perticker_meta if perticker_meta is not None else _get_cached_meta(effective_model)
+
         # Feature version check — prevent crash if model was trained with different features
-        meta = _get_cached_meta(model_name)
-        model_n_features = meta.get("n_features", 0)
-        if model_n_features and model_n_features != len(FEATURE_COLS):
-            logger.warning(
-                "Feature mismatch: model expects %d features, code has %d. "
-                "Run auto_retrain to update the model.",
-                model_n_features, len(FEATURE_COLS),
-            )
-            return _empty_prediction()
+        # For per-ticker models the feature list lives in meta["feature_names"]; for the
+        # universal model it matches FEATURE_COLS exactly.
+        if effective_model == "universal":
+            model_n_features = meta.get("n_features", 0)
+            if model_n_features and model_n_features != len(FEATURE_COLS):
+                logger.warning(
+                    "Feature mismatch: model expects %d features, code has %d. "
+                    "Run auto_retrain to update the model.",
+                    model_n_features, len(FEATURE_COLS),
+                )
+                return _empty_prediction()
 
         # Get data if not provided
         if df is None:
-            import yfinance as yf
-            df = yf.download(ticker, period="1y", progress=False)
+            from data.fetchers.yfinance_fetcher import safe_yf_download
+            df = safe_yf_download(ticker, period="1y", interval="1d")
             if df is None or len(df) < 30:
                 return _empty_prediction()
             if isinstance(df.columns, pd.MultiIndex):
@@ -522,7 +950,20 @@ def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "univ
 
         # Build features (reuse pre-built if provided)
         featured = featured_df if featured_df is not None else build_features(df)
-        latest = featured[FEATURE_COLS].iloc[-1:]
+
+        # ── Feature alignment for per-ticker models ───────────────────────────
+        # Per-ticker models may have been trained on a superset of FEATURE_COLS
+        # (adding regime/calendar features). We need to supply exactly the feature
+        # columns the model was trained on. If a column is missing at prediction
+        # time we fill with 0 (safe default for all our binary/z-score features).
+        if effective_model != "universal" and meta.get("feature_names"):
+            trained_features = meta["feature_names"]
+            for col in trained_features:
+                if col not in featured.columns:
+                    featured[col] = 0.0
+            latest = featured[trained_features].iloc[-1:]
+        else:
+            latest = featured[FEATURE_COLS].iloc[-1:]
 
         if latest.isna().any(axis=1).iloc[0]:
             return _empty_prediction()
@@ -548,8 +989,8 @@ def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "univ
         # Confidence = distance from 50%
         confidence = float(np.clip(abs(bull_prob - 0.5) * 200, 10, 95))
 
-        # Sharpe-adjusted ML score
-        ml_score = _sharpe_adjusted_score(bull_prob, predicted_return, model_name)
+        # Sharpe-adjusted ML score — use effective_model so per-ticker meta is used
+        ml_score = _sharpe_adjusted_score(bull_prob, predicted_return, effective_model)
 
         # Ensemble prediction std for intervals
         tree_preds = np.array([
@@ -557,8 +998,8 @@ def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "univ
         ])
         pred_std = float(np.std(tree_preds))
 
-        # Drift detection
-        drift_warning = _check_drift(predicted_return, model_name)
+        # Drift detection — use effective_model for correct training distribution
+        drift_warning = _check_drift(predicted_return, effective_model)
 
         # Kinematic forecast
         forecast = build_forecast(df, n_days=10)
@@ -571,13 +1012,14 @@ def predict_ticker(ticker: str, df: pd.DataFrame = None, model_name: str = "univ
             "ml_score": round(ml_score, 1),
             "pred_std": round(pred_std, 4),
             "forecast_10d": forecast.to_dict("records"),
+            "model_used": effective_model,
         }
 
         if drift_warning:
             result["drift_warning"] = drift_warning
 
         # Log prediction for drift history
-        _log_prediction(predicted_return, model_name)
+        _log_prediction(predicted_return, effective_model)
 
         return result
 
@@ -735,3 +1177,97 @@ def _empty_prediction() -> dict:
         "pred_std": 0.0,
         "forecast_10d": [],
     }
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="ML Predictor — training CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  Train universal pooled model:
+    python -m analysis.ml.predictor --train
+
+  Train all per-ticker specialized models:
+    python -m analysis.ml.predictor --train-per-ticker
+
+  Train per-ticker model for a single ticker:
+    python -m analysis.ml.predictor --train-per-ticker --ticker SPY
+
+  Force-retrain even if models already exist:
+    python -m analysis.ml.predictor --train-per-ticker --force
+        """,
+    )
+    parser.add_argument("--train", action="store_true",
+                        help="Train the universal pooled model")
+    parser.add_argument("--train-per-ticker", action="store_true",
+                        help="Train per-ticker specialized models for PERTICKER_UNIVERSE")
+    parser.add_argument("--ticker", type=str, default=None,
+                        help="Single ticker to train (use with --train-per-ticker)")
+    parser.add_argument("--force", action="store_true",
+                        help="Force retrain even if model artifacts already exist")
+
+    args = parser.parse_args()
+
+    if args.train:
+        logger.info("Training universal pooled model …")
+        result = train_model("universal")
+        if "error" in result:
+            logger.error("Universal training failed: %s", result["error"])
+            sys.exit(1)
+        logger.info(
+            "Universal model: hit_rate=%.1f%%, edge=%+.1fpp, n=%d, hp=%s",
+            result.get("hit_rate_test", 0),
+            result.get("edge_vs_dummy", 0),
+            result.get("n_samples", 0),
+            result.get("best_hp_tag", "?"),
+        )
+
+    elif args.train_per_ticker:
+        if args.ticker:
+            sym = args.ticker.upper()
+            logger.info("Training per-ticker model for %s (force=%s) …", sym, args.force)
+            meta = train_per_ticker_models(sym, force=args.force)
+            if "error" in meta:
+                logger.error("Failed: %s", meta["error"])
+                sys.exit(1)
+            logger.info(
+                "%s: hit_rate=%.1f%%, edge=%+.1fpp, n=%d, period=%s",
+                sym,
+                meta.get("hit_rate", 0),
+                meta.get("edge_vs_dummy", 0),
+                meta.get("n_samples", 0),
+                meta.get("training_period", "?"),
+            )
+        else:
+            logger.info(
+                "Training per-ticker models for %s (force=%s) …",
+                PERTICKER_UNIVERSE, args.force,
+            )
+            results = train_all_per_ticker_models(force=args.force)
+            print("\n── Per-ticker training summary ──")
+            for sym, meta in results.items():
+                if "error" in meta:
+                    print(f"  {sym}: ERROR — {meta['error']}")
+                else:
+                    print(
+                        f"  {sym}: hit_rate={meta.get('hit_rate', '?')}%  "
+                        f"edge={meta.get('edge_vs_dummy', '?'):+}pp  "
+                        f"n={meta.get('n_samples', '?')}  "
+                        f"hp={meta.get('best_hp_tag', '?')}"
+                    )
+
+    else:
+        parser.print_help()
+        sys.exit(0)

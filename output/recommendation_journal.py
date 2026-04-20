@@ -55,6 +55,7 @@ FIELDS = [
     "earnings_days_out", # int days until next earnings, or ""
     "auto_news",         # top 2 recent headlines, pipe-separated, truncated to 60 chars each
     "political_score",   # 0-100 political-risk exposure score
+    "catalyst_type",     # EARNINGS | FED | POLITICAL | NEWS | TECHNICAL
     "outcome", "exit_price", "pnl_pct", "pnl_dollars", "notes",
 ]
 
@@ -180,6 +181,40 @@ def _auto_news_context(ticker: str) -> tuple:
     return news_str, political_score
 
 
+def _classify_catalyst_type(
+    earnings_flag: str,
+    auto_news: str,
+    political_score,
+    setup_type: str,
+) -> str:
+    """Synthesize a single catalyst_type label from all context signals.
+
+    Priority: EARNINGS > FED > POLITICAL > NEWS > TECHNICAL
+    """
+    if earnings_flag in ("EARNINGS_IMMINENT", "EARNINGS_RISK"):
+        return "EARNINGS"
+
+    # Fed keywords in setup or news
+    fed_kw = ("fed", "fomc", "rate", "powell", "hawkish", "dovish", "taper", "qe")
+    news_lower = auto_news.lower() if auto_news else ""
+    setup_lower = setup_type.lower() if setup_type else ""
+    if any(k in news_lower or k in setup_lower for k in fed_kw):
+        return "FED"
+
+    # Political threshold
+    try:
+        if political_score and float(political_score) >= 25:
+            return "POLITICAL"
+    except (ValueError, TypeError):
+        pass
+
+    # Any auto-detected news
+    if auto_news and auto_news.strip():
+        return "NEWS"
+
+    return "TECHNICAL"
+
+
 def log_recommendation(
     ticker: str,
     direction: str,
@@ -229,6 +264,9 @@ def log_recommendation(
     # ── Auto-enrichment: news + political context ────────────────────────
     auto_news, political_score = _auto_news_context(ticker)
 
+    # ── Catalyst type: synthesize from all context signals ───────────────
+    catalyst_type = _classify_catalyst_type(earnings_flag, auto_news, political_score, setup_type)
+
     row = {
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
         "ticker": ticker.upper(),
@@ -253,6 +291,7 @@ def log_recommendation(
         "earnings_days_out": earnings_days_out,
         "auto_news": auto_news[:240],  # cap at ~4 headlines worth
         "political_score": political_score,
+        "catalyst_type": catalyst_type,
         "outcome": "",
         "exit_price": "",
         "pnl_pct": "",
@@ -479,6 +518,16 @@ def get_journal_stats() -> dict:
             by_setup[str(setup)] = {"n": len(group), "wins": w, "win_rate": round(w/len(group)*100, 1)}
         stats["by_setup"] = by_setup
 
+    # Win rate by catalyst type
+    if "catalyst_type" in df.columns and len(evaluated) > 0:
+        by_catalyst = {}
+        for cat, group in evaluated.groupby("catalyst_type"):
+            if not cat or str(cat) == "nan":
+                continue
+            w = len(group[group["outcome"] == "WIN"])
+            by_catalyst[str(cat)] = {"n": len(group), "wins": w, "win_rate": round(w/len(group)*100, 1)}
+        stats["by_catalyst"] = by_catalyst
+
     # Total realized P&L
     if "pnl_dollars" in df.columns:
         try:
@@ -489,3 +538,97 @@ def get_journal_stats() -> dict:
             stats["total_pnl_dollars"] = 0.0
 
     return stats
+
+
+def generate_weekly_report() -> str:
+    """Generate a markdown 'what's working' report from the journal.
+
+    Covers: overall W/L, win rate by confidence / setup / catalyst, avg P&L,
+    and the top 3 working setups. Saves to memory as pattern_wins_YYYY_wXX.md
+    and returns the path.
+    """
+    import pandas as pd
+
+    stats = get_journal_stats()
+
+    if stats.get("evaluated", 0) < 3:
+        return ""
+
+    now = datetime.datetime.now()
+    week_num = now.isocalendar()[1]
+    year = now.year
+
+    lines = [
+        f"# Pattern Report — {year} Week {week_num:02d}",
+        f"_Generated {now.strftime('%Y-%m-%d %H:%M')}_",
+        "",
+        "## Overall",
+        f"- **Total recommendations:** {stats['total']}",
+        f"- **Evaluated:** {stats['evaluated']} "
+        f"({stats['wins']}W / {stats['losses']}L)",
+        f"- **Win rate:** {stats['win_rate']}%",
+    ]
+
+    pnl = stats.get("total_pnl_dollars")
+    if pnl is not None:
+        sign = "+" if pnl >= 0 else ""
+        lines.append(f"- **Realized P&L:** {sign}${pnl:.2f}")
+
+    # By confidence
+    by_conf = stats.get("by_confidence", {})
+    if by_conf:
+        lines += ["", "## Win Rate by Confidence"]
+        for label, d in sorted(by_conf.items(), reverse=True):
+            lines.append(f"- **{label}:** {d['win_rate']}% ({d['wins']}/{d['n']})")
+
+    # By setup
+    by_setup = stats.get("by_setup", {})
+    if by_setup:
+        lines += ["", "## Win Rate by Setup"]
+        for setup, d in sorted(by_setup.items(), key=lambda x: -x[1]["win_rate"]):
+            lines.append(f"- **{setup}:** {d['win_rate']}% ({d['wins']}/{d['n']})")
+
+    # By catalyst
+    by_cat = stats.get("by_catalyst", {})
+    if by_cat:
+        lines += ["", "## Win Rate by Catalyst Type"]
+        for cat, d in sorted(by_cat.items(), key=lambda x: -x[1]["win_rate"]):
+            lines.append(f"- **{cat}:** {d['win_rate']}% ({d['wins']}/{d['n']})")
+
+    # Top 3 setups
+    if by_setup:
+        top = sorted(by_setup.items(), key=lambda x: (-x[1]["win_rate"], -x[1]["n"]))[:3]
+        if top:
+            lines += ["", "## Top Working Setups"]
+            for i, (setup, d) in enumerate(top, 1):
+                lines.append(f"{i}. **{setup}** — {d['win_rate']}% win rate, {d['n']} trades")
+
+    # Calibration warning
+    if stats["win_rate"] < 50 and stats["evaluated"] >= 10:
+        hi = by_conf.get("high (80+)", {})
+        if hi and hi["win_rate"] < 50:
+            lines += [
+                "",
+                "## ⚠️ Calibration Warning",
+                f"High-confidence picks (80+) winning only {hi['win_rate']}% — "
+                "scoring formula needs recalibration before scaling.",
+            ]
+
+    lines += ["", "---", "_Auto-generated by `generate_weekly_report()`_"]
+    report = "\n".join(lines)
+
+    # Save to memory directory
+    memory_dir = os.path.join(
+        os.path.expanduser("~"), ".claude", "projects",
+        "-Users-jacolby-app", "memory",
+    )
+    os.makedirs(memory_dir, exist_ok=True)
+    report_file = os.path.join(memory_dir, f"pattern_wins_{year}_w{week_num:02d}.md")
+    try:
+        with open(report_file, "w") as f:
+            f.write(report)
+        logger.info("Weekly report saved: %s", report_file)
+    except Exception as e:
+        logger.warning("Could not save weekly report: %s", e)
+
+    return report_file
