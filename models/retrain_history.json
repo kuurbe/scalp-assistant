@@ -28,5 +28,25 @@
     "n_samples": 709,
     "n_features": 32,
     "warnings": 2
+  },
+  {
+    "date": "2026-04-19T07:31:57.673586",
+    "hit_rate": 49.5,
+    "r2": -0.0129,
+    "sharpe": 14.693,
+    "dummy_baseline": 53.6,
+    "n_samples": 709,
+    "n_features": 32,
+    "warnings": 2
+  },
+  {
+    "date": "2026-04-19T20:42:28.828488",
+    "hit_rate": 55.0,
+    "r2": -0.0073,
+    "sharpe": -0.553,
+    "dummy_baseline": 55.5,
+    "n_samples": 18434,
+    "n_features": 32,
+    "warnings": 1
   }
 ]

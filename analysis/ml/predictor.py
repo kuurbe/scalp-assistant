@@ -85,30 +85,98 @@ def _meta_path(ticker: str = "universal") -> str:
 
 # ── TRAINING ─────────────────────────────────────────────────────────────────
 
+def _universal_training_universe() -> list[str]:
+    """Tickers to pool into the universal model's training set.
+
+    Covers broad-market indices + liquid large-caps + sector ETFs so the model
+    learns patterns that generalize across regimes instead of memorizing SPY.
+    """
+    return [
+        # Major indices
+        "SPY", "QQQ", "IWM", "DIA",
+        # Sector ETFs (diverse regimes: tech, energy, financials, health, utilities)
+        "XLK", "XLF", "XLE", "XLV", "XLU", "XLI", "XLP", "XLB",
+        # Mega-cap stocks (high liquidity, clean data)
+        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AMD",
+        "JPM", "BAC", "WMT", "XOM", "JNJ", "UNH",
+    ]
+
+
+def _fetch_pooled_training_data(tickers: list[str], lookback_days: int) -> pd.DataFrame:
+    """Fetch OHLCV for each ticker, build features, stack into one DataFrame.
+
+    Each row carries a '_ticker' column so we can do cross-instrument walk-forward.
+    Returns a single DataFrame indexed by (ticker, date).
+    """
+    from data.fetchers.yfinance_fetcher import safe_yf_download
+
+    frames = []
+    for sym in tickers:
+        try:
+            df = safe_yf_download(sym, period=f"{lookback_days}d", interval="1d")
+            if df is None or len(df) < 60:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            feat = build_features(df).copy()
+            feat["target_ret"] = feat["Close"].pct_change().shift(-1) * 100
+            feat["_ticker"] = sym
+            frames.append(feat)
+        except Exception as e:
+            logger.debug("pooled training: %s fetch failed: %s", sym, e)
+            continue
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, axis=0).sort_index()
+
+
 def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
     """Train dual models with walk-forward TimeSeriesSplit validation.
 
     Walk-forward prevents look-ahead bias: each fold trains on past data only
     and tests on the next unseen period. Final model is trained on all data.
 
+    For the "universal" model we pool across a curated universe of indices +
+    sector ETFs + mega-caps so the model sees ~30x more samples than SPY alone
+    and learns cross-instrument regime patterns. Per-ticker models (e.g. for
+    SPY, QQQ individually) still train on a single symbol's history.
+
     Returns dict with per-fold metrics, overfitting diagnostics, and feature importances.
     """
-    import yfinance as yf
+    from data.fetchers.yfinance_fetcher import safe_yf_download
 
-    symbol = "SPY" if ticker == "universal" else ticker
+    if ticker == "universal":
+        universe = _universal_training_universe()
+        pooled = _fetch_pooled_training_data(universe, lookback_days)
+        if pooled.empty:
+            return {"error": "Pooled training fetch returned no data"}
+        featured = pooled
+        logger.info("Pooled training: %d tickers, %d rows",
+                    featured["_ticker"].nunique(), len(featured))
+    else:
+        df = safe_yf_download(ticker, period=f"{lookback_days}d", interval="1d")
+        if df is None or len(df) < 60:
+            return {"error": f"Not enough data for {ticker}"}
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        featured = build_features(df).copy()
+        featured["target_ret"] = featured["Close"].pct_change().shift(-1) * 100
+        featured["_ticker"] = ticker
 
-    df = yf.download(symbol, period=f"{lookback_days}d", progress=False)
-    if df is None or len(df) < 60:
-        return {"error": f"Not enough data for {symbol}"}
+    # Directional target with a minimum-move threshold. 0.05% was noise-level;
+    # requiring >0.25% on the next bar filters out random walk and lines the
+    # target up with what a trader would actually act on.
+    featured["target_dir"] = (featured["target_ret"] > 0.25).astype(int)
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    featured = build_features(df)
-
-    # Targets
-    featured["target_ret"] = featured["Close"].pct_change().shift(-1) * 100
-    featured["target_dir"] = (featured["target_ret"] > 0.05).astype(int)
+    # For pooled training we MUST sort by date across all tickers so walk-forward
+    # splits don't mix future-and-past data from different symbols.
+    if "_ticker" in featured.columns:
+        # If the index already is the date, sort by it; if not, try to coerce.
+        try:
+            featured = featured.sort_index()
+        except Exception:
+            pass
 
     clean = featured.dropna(subset=FEATURE_COLS + ["target_ret"])
 
@@ -190,9 +258,21 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
     ss_tot = np.sum((all_test_actual_ret - np.mean(all_test_actual_ret)) ** 2)
     wf_r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-    # Sharpe of predictions (penalizes noisy signals)
-    pred_returns = all_test_preds_ret
-    sharpe = float(np.mean(pred_returns) / (np.std(pred_returns) + 1e-8)) * np.sqrt(252)
+    # STRATEGY Sharpe — what a long/short trader would earn following the classifier.
+    # Previously this was computed on predicted_returns alone, giving meaningless
+    # values like 14.0 even when the model was worse than baseline. Now we compute
+    # the actual P&L: take direction prediction (0/1 → -1/+1) times actual return,
+    # so a 50% hit rate with symmetric returns gives Sharpe ≈ 0.
+    strategy_signals = (all_test_preds_dir * 2 - 1)  # 0/1 → -1/+1
+    strategy_returns = strategy_signals * all_test_actual_ret  # in % units
+    if np.std(strategy_returns) > 1e-8:
+        sharpe = float(np.mean(strategy_returns) / np.std(strategy_returns)) * np.sqrt(252)
+    else:
+        sharpe = 0.0
+
+    # Also report raw stats separately so the retrain report shows the right picture
+    strategy_mean_bp = float(np.mean(strategy_returns))  # mean % return per trade
+    strategy_std_bp = float(np.std(strategy_returns))
 
     # ── Overfitting detection ──
     avg_r2_train = np.mean([f["r2_train"] for f in fold_results])
@@ -244,16 +324,23 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
     joblib.dump(clf_model, _model_path(ticker, "clf"))
     joblib.dump(scaler, _scaler_path(ticker))
 
-    # Save metadata for drift detection
+    # Save metadata for drift detection + report card
     meta = {
         "wf_hit_rate": round(wf_hit_rate, 1),
         "wf_r2": round(wf_r2, 4),
         "dummy_baseline": round(dummy_hit, 1),
+        "edge_vs_dummy": round(wf_hit_rate - dummy_hit, 1),
         "class_balance": round(class_balance, 3),
         "n_features": len(FEATURE_COLS),
-        "sharpe": round(sharpe, 3),
+        "n_samples": len(clean),
+        "sharpe": round(sharpe, 3),                       # strategy Sharpe now
+        "strategy_mean_pct": round(strategy_mean_bp, 4),  # mean per-trade %
+        "strategy_std_pct": round(strategy_std_bp, 4),
         "pred_mean": round(float(np.mean(all_test_preds_ret)), 4),
         "pred_std": round(float(np.std(all_test_preds_ret)), 4),
+        "target_threshold_pct": 0.25,
+        "training_universe": featured["_ticker"].unique().tolist()
+                              if "_ticker" in featured.columns else [ticker],
     }
     with open(_meta_path(ticker), "w") as f:
         json.dump(meta, f)
@@ -264,11 +351,15 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
         "hit_rate_train": round(avg_hit_train, 1),
         "hit_rate_test": round(wf_hit_rate, 1),
         "dummy_baseline": round(dummy_hit, 1),
+        "edge_vs_dummy": round(wf_hit_rate - dummy_hit, 1),
         "sharpe": round(sharpe, 3),
+        "strategy_mean_pct": round(strategy_mean_bp, 4),
+        "strategy_std_pct": round(strategy_std_bp, 4),
         "class_balance": round(class_balance, 3),
         "n_samples": len(clean),
         "n_train": len(X) - len(X) // (n_splits + 1),
         "n_test": len(X) // (n_splits + 1),
+        "n_tickers_pooled": len(meta["training_universe"]),
         "fold_results": fold_results,
         "warnings": warnings,
         "feature_importances": {k: round(v, 4) for k, v in
