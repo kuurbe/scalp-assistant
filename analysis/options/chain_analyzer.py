@@ -131,12 +131,13 @@ def compute_iv_rank(ticker: str, current_iv: float) -> dict:
     Also returns historical volatility for comparison.
     """
     try:
-        import yfinance as yf
+        from data.fetchers.yfinance_fetcher import safe_yf_download
 
-        df = yf.download(ticker, period="60d", progress=False)
+        df = safe_yf_download(ticker, period="60d")
         if df is None or len(df) < 20:
             return {"iv_rank": 50.0, "iv_percentile": 50.0, "hv_30d": current_iv, "iv_vs_hv": 1.0}
 
+        # Flatten MultiIndex columns produced by yf.download (ticker in level 0)
         if hasattr(df.columns, "levels"):
             df.columns = df.columns.get_level_values(0)
 

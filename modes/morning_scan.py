@@ -26,6 +26,28 @@ def run_morning_scan(top_n: int = None, tickers: str = None, asset_class: str = 
     else:
         universe = settings.get_universe(asset_class)
 
+    # Augment with Finviz momentum movers + Barchart options volume leaders
+    if asset_class in ("stocks", "etfs") and not tickers:
+        try:
+            from data.fetchers.finviz_fetcher import augment_universe
+            universe = augment_universe(universe)
+        except Exception:
+            pass
+        try:
+            from data.fetchers.barchart_fetcher import get_options_volume_leaders
+            bc_leaders = get_options_volume_leaders(top_n=20)
+            existing = set(universe)
+            new_from_bc = [t for t in bc_leaders if t not in existing][:10]
+            if new_from_bc:
+                import logging
+                logging.getLogger(__name__).info(
+                    "Barchart added %d options-volume tickers: %s",
+                    len(new_from_bc), new_from_bc
+                )
+            universe = universe + new_from_bc
+        except Exception:
+            pass
+
     console.print(f"  Scanning {len(universe)} tickers...\n")
 
     # 1. Macro context
@@ -582,12 +604,24 @@ def _catalyst_analysis(ticker, reddit_data, short_data) -> tuple:
         if reddit_data and ticker in reddit_data:
             reddit_trending = True
 
+        # Barchart unusual options — smart money directional signal
+        unusual_options = False
+        try:
+            from data.fetchers.barchart_fetcher import get_unusual_options
+            bc = get_unusual_options(ticker)
+            unusual_options = bool(bc and bc.get("ratio", 0) >= 2.0)
+            if unusual_options:
+                cat_info["barchart_unusual"] = bc
+        except Exception:
+            pass
+
         from analysis.scoring.catalyst_score import compute_catalyst_score
         cat_score = compute_catalyst_score(
             news_score=cat_info.get("catalyst_score", 0),
             sentiment_score=sentiment.get("sentiment_score", 0),
             reddit_trending=reddit_trending,
             short_ratio=short_ratio,
+            unusual_options=unusual_options,
         )
 
         return cat_info, round(cat_score, 1)

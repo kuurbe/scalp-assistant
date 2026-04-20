@@ -50,6 +50,11 @@ FIELDS = [
     "stop_price", "target_1", "target_2",
     "confidence", "rationale", "catalysts", "market_regime", "setup_type",
     "horizon_hours",
+    # Auto-populated on every log call
+    "earnings_flag",     # "" | "EARNINGS_RISK" | "EARNINGS_IMMINENT"
+    "earnings_days_out", # int days until next earnings, or ""
+    "auto_news",         # top 2 recent headlines, pipe-separated, truncated to 60 chars each
+    "political_score",   # 0-100 political-risk exposure score
     "outcome", "exit_price", "pnl_pct", "pnl_dollars", "notes",
 ]
 
@@ -60,6 +65,119 @@ def _ensure_file():
         with open(JOURNAL_FILE, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=FIELDS)
             writer.writeheader()
+    else:
+        _migrate_schema()
+
+
+def _migrate_schema():
+    """Add any new columns to an existing CSV without touching existing data."""
+    try:
+        import pandas as pd
+        df = pd.read_csv(JOURNAL_FILE)
+        missing = [f for f in FIELDS if f not in df.columns]
+        if missing:
+            for col in missing:
+                df[col] = ""
+            df = df[FIELDS]  # enforce column order
+            df.to_csv(JOURNAL_FILE, index=False)
+            logger.info("Schema migrated: added columns %s", missing)
+    except Exception as e:
+        logger.debug("_migrate_schema failed: %s", e)
+
+
+def _check_earnings(ticker: str, horizon_hours: float) -> tuple:
+    """Check if ticker has upcoming earnings that overlap the trade horizon.
+
+    Returns (flag, days_out):
+        flag: "EARNINGS_IMMINENT" (inside horizon) | "EARNINGS_RISK" (≤3 days) | ""
+        days_out: int days until next earnings, or "" on failure
+    """
+    try:
+        import yfinance as yf
+        t = yf.Ticker(ticker)
+        cal = t.calendar
+
+        earnings_date = None
+
+        if cal is None:
+            return "", ""
+
+        # yfinance can return a DataFrame or a dict depending on version
+        if hasattr(cal, "columns"):
+            # DataFrame: rows = metrics, columns = dates. First column = next earnings.
+            try:
+                date_val = cal.iloc[0, 0]
+                if hasattr(date_val, "date"):
+                    earnings_date = date_val.date()
+                elif isinstance(date_val, str):
+                    earnings_date = datetime.datetime.strptime(date_val[:10], "%Y-%m-%d").date()
+            except Exception:
+                pass
+        elif isinstance(cal, dict):
+            ed = cal.get("Earnings Date") or []
+            if ed:
+                ev = ed[0] if isinstance(ed, list) else ed
+                if hasattr(ev, "date"):
+                    earnings_date = ev.date()
+                elif isinstance(ev, str):
+                    try:
+                        earnings_date = datetime.datetime.strptime(ev[:10], "%Y-%m-%d").date()
+                    except Exception:
+                        pass
+
+        if earnings_date is None:
+            return "", ""
+
+        today = datetime.date.today()
+        days_out = (earnings_date - today).days
+        if days_out < 0:
+            return "", ""  # Already passed
+
+        if days_out * 24 <= horizon_hours:
+            return "EARNINGS_IMMINENT", days_out
+        if days_out <= 3:
+            return "EARNINGS_RISK", days_out
+
+        return "", days_out
+
+    except Exception as e:
+        logger.debug("_check_earnings(%s) failed: %s", ticker, e)
+        return "", ""
+
+
+def _auto_news_context(ticker: str) -> tuple:
+    """Fetch top 2 recent news headlines + political exposure for a ticker.
+
+    Returns (news_str, political_score):
+        news_str: "Headline 1 (60 chars)|Headline 2" or ""
+        political_score: float 0-100 or ""
+    """
+    news_str = ""
+    political_score = ""
+
+    # Recent headlines from aggregator
+    try:
+        from catalyst.news_aggregator import aggregate_news
+        news = aggregate_news(ticker, max_age_hours=24)
+        if news:
+            heads = [item.get("headline", "")[:60] for item in news[:2]
+                     if item.get("headline")]
+            news_str = "|".join(heads)
+    except Exception as e:
+        logger.debug("_auto_news_context news failed (%s): %s", ticker, e)
+
+    # Political exposure score
+    try:
+        from catalyst.political_tracker import get_political_pulse, get_ticker_political_exposure
+        pulse = get_political_pulse()
+        events = pulse.get("events", [])
+        if events:
+            score = get_ticker_political_exposure(ticker, events)
+            political_score = round(score, 1)
+    except Exception as e:
+        logger.debug("_auto_news_context politics failed (%s): %s", ticker, e)
+
+    return news_str, political_score
 
 
 def log_recommendation(
@@ -82,7 +200,13 @@ def log_recommendation(
     setup_type: str = "",
     horizon_hours: float = 6.5,
 ) -> dict:
-    """Log a play recommendation. Returns the row dict written."""
+    """Log a play recommendation. Returns the row dict written.
+
+    Auto-populates:
+        earnings_flag / earnings_days_out  — yfinance calendar gate
+        auto_news                          — top 2 recent headlines
+        political_score                    — political risk 0-100
+    """
     _ensure_file()
 
     total_cost = 0.0
@@ -90,6 +214,20 @@ def log_recommendation(
         total_cost = contract_cost * 100 * quantity  # options contracts = 100 shares
     elif entry_price > 0:
         total_cost = entry_price * quantity
+
+    # ── Auto-enrichment: earnings gate ──────────────────────────────────
+    earnings_flag, earnings_days_out = _check_earnings(ticker, horizon_hours)
+    if earnings_flag == "EARNINGS_IMMINENT":
+        logger.warning(
+            "EARNINGS_IMMINENT for %s — earnings in %s days, horizon %.1fh. "
+            "Logging anyway; review before entering.",
+            ticker, earnings_days_out, horizon_hours,
+        )
+    elif earnings_flag == "EARNINGS_RISK":
+        logger.info("EARNINGS_RISK: %s has earnings in %s days.", ticker, earnings_days_out)
+
+    # ── Auto-enrichment: news + political context ────────────────────────
+    auto_news, political_score = _auto_news_context(ticker)
 
     row = {
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -111,6 +249,10 @@ def log_recommendation(
         "market_regime": market_regime,
         "setup_type": setup_type,
         "horizon_hours": horizon_hours,
+        "earnings_flag": earnings_flag,
+        "earnings_days_out": earnings_days_out,
+        "auto_news": auto_news[:240],  # cap at ~4 headlines worth
+        "political_score": political_score,
         "outcome": "",
         "exit_price": "",
         "pnl_pct": "",
