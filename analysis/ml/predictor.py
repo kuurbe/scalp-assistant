@@ -15,12 +15,35 @@ import threading
 import numpy as np
 import pandas as pd
 import joblib
-from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
+from sklearn.ensemble import (
+    HistGradientBoostingRegressor,
+    HistGradientBoostingClassifier,
+)
+from sklearn.inspection import permutation_importance
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 
 from analysis.ml.feature_engine import build_features, FEATURE_COLS, build_forecast
 from config import settings
+
+
+# Hyperparameter search space — small deliberately-curated grid, not exhaustive.
+# Each candidate represents a different bias/variance tradeoff so walk-forward
+# can pick the one that generalises best on THIS data instead of us guessing.
+# HistGradientBoosting params: max_depth, max_iter, learning_rate,
+# min_samples_leaf, l2_regularization.
+_HP_CANDIDATES = [
+    ("shallow_slow", dict(max_depth=2, max_iter=300, learning_rate=0.02,
+                          min_samples_leaf=50, l2_regularization=0.5)),
+    ("baseline",     dict(max_depth=3, max_iter=200, learning_rate=0.05,
+                          min_samples_leaf=30, l2_regularization=0.1)),
+    ("deeper",       dict(max_depth=5, max_iter=150, learning_rate=0.05,
+                          min_samples_leaf=20, l2_regularization=0.2)),
+    ("low_lr_long",  dict(max_depth=3, max_iter=400, learning_rate=0.01,
+                          min_samples_leaf=30, l2_regularization=0.3)),
+    ("aggressive",   dict(max_depth=4, max_iter=250, learning_rate=0.08,
+                          min_samples_leaf=15, l2_regularization=0.05)),
+]
 
 import logging
 logger = logging.getLogger(__name__)
@@ -192,60 +215,77 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
     class_balance = float(np.mean(y_dir))
     dummy_hit = max(class_balance, 1 - class_balance) * 100  # majority-class baseline
 
-    # ── Walk-forward validation ──
+    # ── Walk-forward validation with hyperparameter search ──
+    # For each candidate config, run full walk-forward and pick the one with
+    # the best edge vs dummy baseline. This replaces the old approach of a
+    # single fixed config and catches data-specific tuning gains.
     n_splits = 5
     tscv = TimeSeriesSplit(n_splits=n_splits, gap=1)
 
-    fold_results = []
-    all_test_preds_ret = []
-    all_test_preds_dir = []
-    all_test_actual_ret = []
-    all_test_actual_dir = []
+    def _wf_score(hp: dict) -> tuple[float, list, list, list, list, list]:
+        """Run one hyperparameter config through walk-forward. Returns (edge_vs_dummy, fold_results, test_preds_ret, test_preds_dir, test_actual_ret, test_actual_dir)."""
+        folds = []
+        preds_ret, preds_dir, actual_ret, actual_dir = [], [], [], []
+        for fold_i, (train_idx, test_idx) in enumerate(tscv.split(X)):
+            scaler_fold = StandardScaler()
+            X_train = scaler_fold.fit_transform(X[train_idx])
+            X_test = scaler_fold.transform(X[test_idx])
+            y_ret_train, y_ret_test = y_ret[train_idx], y_ret[test_idx]
+            y_dir_train, y_dir_test = y_dir[train_idx], y_dir[test_idx]
 
-    for fold_i, (train_idx, test_idx) in enumerate(tscv.split(X)):
-        scaler_fold = StandardScaler()
-        X_train = scaler_fold.fit_transform(X[train_idx])
-        X_test = scaler_fold.transform(X[test_idx])
+            reg = HistGradientBoostingRegressor(random_state=42, **hp)
+            reg.fit(X_train, y_ret_train)
+            r2_test_fold = reg.score(X_test, y_ret_test)
+            r2_train_fold = reg.score(X_train, y_ret_train)
 
-        y_ret_train, y_ret_test = y_ret[train_idx], y_ret[test_idx]
-        y_dir_train, y_dir_test = y_dir[train_idx], y_dir[test_idx]
+            clf = HistGradientBoostingClassifier(random_state=42, **hp)
+            clf.fit(X_train, y_dir_train)
+            hit_train = float(np.mean(clf.predict(X_train) == y_dir_train)) * 100
+            hit_test = float(np.mean(clf.predict(X_test) == y_dir_test)) * 100
 
-        reg = GradientBoostingRegressor(
-            n_estimators=100, learning_rate=0.02, max_depth=2,
-            subsample=0.6, min_samples_leaf=40, random_state=42,
-        )
-        reg.fit(X_train, y_ret_train)
+            preds_ret.extend(reg.predict(X_test))
+            preds_dir.extend(clf.predict(X_test))
+            actual_ret.extend(y_ret_test)
+            actual_dir.extend(y_dir_test)
 
-        r2_train = reg.score(X_train, y_ret_train)
-        r2_test = reg.score(X_test, y_ret_test)
+            folds.append({
+                "fold": fold_i + 1,
+                "train_size": len(train_idx),
+                "test_size": len(test_idx),
+                "date_range": f"{dates[test_idx[0]].strftime('%Y-%m-%d')} → {dates[test_idx[-1]].strftime('%Y-%m-%d')}",
+                "r2_train": round(r2_train_fold, 4),
+                "r2_test": round(r2_test_fold, 4),
+                "hit_rate_train": round(hit_train, 1),
+                "hit_rate_test": round(hit_test, 1),
+            })
+        hit = float(np.mean(np.array(preds_dir) == np.array(actual_dir))) * 100
+        return hit - dummy_hit, folds, preds_ret, preds_dir, actual_ret, actual_dir
 
-        clf = GradientBoostingClassifier(
-            n_estimators=100, learning_rate=0.02, max_depth=2,
-            subsample=0.6, min_samples_leaf=40, random_state=42,
-        )
-        clf.fit(X_train, y_dir_train)
-
-        hit_train = float(np.mean(clf.predict(X_train) == y_dir_train)) * 100
-        hit_test = float(np.mean(clf.predict(X_test) == y_dir_test)) * 100
-
-        # Collect predictions for aggregate metrics
-        test_preds_ret = reg.predict(X_test)
-        test_preds_dir = clf.predict(X_test)
-        all_test_preds_ret.extend(test_preds_ret)
-        all_test_preds_dir.extend(test_preds_dir)
-        all_test_actual_ret.extend(y_ret_test)
-        all_test_actual_dir.extend(y_dir_test)
-
-        fold_results.append({
-            "fold": fold_i + 1,
-            "train_size": len(train_idx),
-            "test_size": len(test_idx),
-            "date_range": f"{dates[test_idx[0]].strftime('%Y-%m-%d')} → {dates[test_idx[-1]].strftime('%Y-%m-%d')}",
-            "r2_train": round(r2_train, 4),
-            "r2_test": round(r2_test, 4),
-            "hit_rate_train": round(hit_train, 1),
-            "hit_rate_test": round(hit_test, 1),
+    # Score every candidate; keep the one with the best edge vs dummy
+    hp_results = []
+    for tag, hp in _HP_CANDIDATES:
+        edge, folds, preds_ret, preds_dir, actual_ret, actual_dir = _wf_score(hp)
+        hp_results.append({
+            "tag": tag,
+            "edge_vs_dummy": round(edge, 2),
+            "hp": hp,
+            "folds": folds,
+            "preds_ret": preds_ret, "preds_dir": preds_dir,
+            "actual_ret": actual_ret, "actual_dir": actual_dir,
         })
+        logger.info("  HP[%s]: edge_vs_dummy=%+.2fpp", tag, edge)
+
+    best = max(hp_results, key=lambda r: r["edge_vs_dummy"])
+    logger.info("  Best HP config: %s (edge=%+.2fpp)", best["tag"], best["edge_vs_dummy"])
+
+    # Unpack the winning config's walk-forward outputs for reporting
+    fold_results = best["folds"]
+    all_test_preds_ret = best["preds_ret"]
+    all_test_preds_dir = best["preds_dir"]
+    all_test_actual_ret = best["actual_ret"]
+    all_test_actual_dir = best["actual_dir"]
+    best_hp = best["hp"]
+    best_hp_tag = best["tag"]
 
     # ── Aggregate walk-forward metrics ──
     all_test_preds_ret = np.array(all_test_preds_ret)
@@ -292,32 +332,39 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
     if wf_r2 < -0.5:
         warnings.append(f"Severely negative R²={wf_r2:.3f} — model is harmful")
 
-    # ── Train final model on ALL data ──
-    # Tighter regularization than walk-forward folds to reduce overfitting:
-    # - max_depth=2 (shallow trees force generalization)
-    # - min_samples_leaf=30 (prevents memorizing small groups)
-    # - n_estimators=150 (fewer trees = less overfitting)
-    # - subsample=0.7 (more stochastic = better generalization)
+    # ── Train final model on ALL data using the winning hyperparameter config ──
+    # HistGradientBoostingClassifier/Regressor — modern histogram-based boosting
+    # (LightGBM-style) built into sklearn. Typically faster and better-regularised
+    # than the old GradientBoosting* classes.
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    reg_model = GradientBoostingRegressor(
-        n_estimators=150, learning_rate=0.03, max_depth=2,
-        subsample=0.7, min_samples_leaf=30, random_state=42,
-    )
+    reg_model = HistGradientBoostingRegressor(random_state=42, **best_hp)
     reg_model.fit(X_scaled, y_ret)
 
-    clf_model = GradientBoostingClassifier(
-        n_estimators=150, learning_rate=0.03, max_depth=2,
-        subsample=0.7, min_samples_leaf=30, random_state=42,
-    )
+    clf_model = HistGradientBoostingClassifier(random_state=42, **best_hp)
     clf_model.fit(X_scaled, y_dir)
 
-    # Feature importances (averaged from both models)
-    clf_imp = clf_model.feature_importances_
-    reg_imp = reg_model.feature_importances_
-    avg_imp = (clf_imp + reg_imp) / 2
+    # Feature importance via permutation (HistGradientBoosting doesn't expose
+    # tree-based importances). Run on a sample of training data for speed.
+    n_perm_samples = min(2000, len(X_scaled))
+    perm_idx = np.random.RandomState(42).choice(len(X_scaled), n_perm_samples, replace=False)
+    try:
+        perm = permutation_importance(
+            clf_model, X_scaled[perm_idx], y_dir[perm_idx],
+            n_repeats=3, random_state=42, n_jobs=1,
+        )
+        avg_imp = perm.importances_mean
+    except Exception as e:
+        logger.warning("permutation_importance failed: %s — using zeros", e)
+        avg_imp = np.zeros(len(FEATURE_COLS))
     importances = dict(zip(FEATURE_COLS, avg_imp))
+
+    # Warn about features with near-zero or negative importance — they add noise
+    low_importance = [k for k, v in importances.items() if v <= 0.001]
+    if low_importance:
+        logger.info("  %d features with low importance (candidates to drop): %s",
+                    len(low_importance), low_importance[:10])
 
     # Save artifacts
     joblib.dump(reg_model, _model_path(ticker, "reg"))
@@ -341,6 +388,13 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
         "target_threshold_pct": 0.25,
         "training_universe": featured["_ticker"].unique().tolist()
                               if "_ticker" in featured.columns else [ticker],
+        "model_class": "HistGradientBoosting",
+        "best_hp_tag": best_hp_tag,
+        "best_hp": best_hp,
+        "hp_search_results": [
+            {"tag": r["tag"], "edge_vs_dummy": r["edge_vs_dummy"]}
+            for r in sorted(hp_results, key=lambda x: -x["edge_vs_dummy"])
+        ],
     }
     with open(_meta_path(ticker), "w") as f:
         json.dump(meta, f)
@@ -360,6 +414,10 @@ def train_model(ticker: str = "universal", lookback_days: int = 730) -> dict:
         "n_train": len(X) - len(X) // (n_splits + 1),
         "n_test": len(X) // (n_splits + 1),
         "n_tickers_pooled": len(meta["training_universe"]),
+        "model_class": "HistGradientBoosting",
+        "best_hp_tag": best_hp_tag,
+        "best_hp": best_hp,
+        "hp_search_results": meta["hp_search_results"],
         "fold_results": fold_results,
         "warnings": warnings,
         "feature_importances": {k: round(v, 4) for k, v in

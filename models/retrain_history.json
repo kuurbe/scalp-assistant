@@ -48,5 +48,15 @@
     "n_samples": 18434,
     "n_features": 32,
     "warnings": 1
+  },
+  {
+    "date": "2026-04-19T20:52:12.878208",
+    "hit_rate": 54.9,
+    "r2": -0.0138,
+    "sharpe": -0.523,
+    "dummy_baseline": 55.5,
+    "n_samples": 18434,
+    "n_features": 32,
+    "warnings": 1
   }
 ]
