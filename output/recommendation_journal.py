@@ -56,6 +56,7 @@ FIELDS = [
     "auto_news",         # top 2 recent headlines, pipe-separated, truncated to 60 chars each
     "political_score",   # 0-100 political-risk exposure score
     "catalyst_type",     # EARNINGS | FED | POLITICAL | NEWS | TECHNICAL
+    "entry_delta",       # option delta at entry (0-1), for realistic P&L calc
     "outcome", "exit_price", "pnl_pct", "pnl_dollars", "notes",
 ]
 
@@ -215,6 +216,61 @@ def _classify_catalyst_type(
     return "TECHNICAL"
 
 
+def _compute_entry_delta(
+    ticker: str,
+    entry_price: float,
+    strike: float,
+    expiry: str,
+    direction: str,
+) -> float:
+    """Compute option delta at entry using real IV from chain or ATR fallback.
+
+    Returns delta in [0, 1] (always positive — sign inferred from direction).
+    Defaults to 0.50 (ATM) on any failure.
+    """
+    try:
+        from analysis.options_math import compute_full_greeks
+        import datetime as _dt
+
+        # DTE in years
+        try:
+            exp_date = _dt.datetime.strptime(expiry[:10], "%Y-%m-%d").date()
+            dte_days = max((exp_date - _dt.date.today()).days, 0)
+            dte_years = max(dte_days / 365.0, 1 / (365 * 6.5))  # min = 1 bar
+        except Exception:
+            dte_years = 1 / 365.0  # 0DTE fallback
+
+        # Try real IV from chain first
+        iv = 0.30  # fallback
+        try:
+            from analysis.options.chain_analyzer import get_scalp_chain
+            chain = get_scalp_chain(ticker, entry_price, direction.lower())
+            if chain and chain.get("atm_iv", 0) > 0.01:
+                iv = chain["atm_iv"]
+        except Exception:
+            pass
+
+        # If chain unavailable, estimate IV from ATR
+        if iv == 0.30:
+            try:
+                from analysis.options_math import estimate_iv_from_atr
+                iv_est = estimate_iv_from_atr(ticker, entry_price)
+                if iv_est and iv_est > 0.01:
+                    iv = iv_est
+            except Exception:
+                pass
+
+        greeks = compute_full_greeks(
+            entry_price, strike, dte_years, iv, direction=direction.lower(),
+        )
+        delta = abs(greeks.get("delta", 0.50))
+        return round(max(0.01, min(1.0, delta)), 4)
+
+    except Exception as e:
+        logger.debug("_compute_entry_delta(%s) failed: %s", ticker, e)
+        return 0.50
+
+
 def log_recommendation(
     ticker: str,
     direction: str,
@@ -267,6 +323,12 @@ def log_recommendation(
     # ── Catalyst type: synthesize from all context signals ───────────────
     catalyst_type = _classify_catalyst_type(earnings_flag, auto_news, political_score, setup_type)
 
+    # ── Entry delta: real Greeks for options, blank for stocks ───────────
+    entry_delta = ""
+    is_options = (contract_cost is not None and strike is not None and expiry)
+    if is_options:
+        entry_delta = _compute_entry_delta(ticker, entry_price, strike, expiry, direction)
+
     row = {
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
         "ticker": ticker.upper(),
@@ -292,6 +354,7 @@ def log_recommendation(
         "auto_news": auto_news[:240],  # cap at ~4 headlines worth
         "political_score": political_score,
         "catalyst_type": catalyst_type,
+        "entry_delta": entry_delta,
         "outcome": "",
         "exit_price": "",
         "pnl_pct": "",
@@ -446,14 +509,44 @@ def evaluate_open_recommendations(force: bool = False) -> dict:
             df.at[idx, "exit_price"] = round(exit_price, 4)
             df.at[idx, "pnl_pct"] = round(pnl_pct, 2)
 
-            # Approximate dollar P&L using delta=0.5 for options
+            # Loss post-mortem template — auto-fill notes if empty on LOSS
+            if outcome == "LOSS":
+                existing_notes = str(df.at[idx, "notes"] if "notes" in df.columns else "")
+                if not existing_notes or existing_notes in ("", "nan"):
+                    setup = str(df.at[idx, "setup_type"] or "")
+                    cat = str(df.at[idx, "catalyst_type"] if "catalyst_type" in df.columns else "")
+                    earnings = str(df.at[idx, "earnings_flag"] if "earnings_flag" in df.columns else "")
+                    pm = (
+                        f"[POST-MORTEM NEEDED] Setup: {setup or 'unknown'}. "
+                        f"Catalyst: {cat or 'unknown'}. "
+                        f"Earnings flag: {earnings or 'none'}. "
+                        f"Loss: {round(pnl_pct, 1)}%. "
+                        f"Fill in: 1) what went wrong, 2) what signal was missed, 3) rule to add."
+                    )
+                    df.at[idx, "notes"] = pm
+
+            # Dollar P&L — use stored entry_delta for options, face value for stocks
             try:
                 total_cost = float(df.at[idx, "total_cost"] or 0)
-                if df.at[idx, "contract_cost"] != "" and pd.notna(df.at[idx, "contract_cost"]):
-                    # Rough: option moves ~50% of underlying move at ATM
-                    pnl_dollars = total_cost * (pnl_pct / 100) * 5  # crude leverage estimate
+                contract_cost_val = df.at[idx, "contract_cost"]
+                is_opt = (contract_cost_val != "" and pd.notna(contract_cost_val))
+
+                if is_opt:
+                    # Realistic: underlying_move × delta × 100 shares/contract × quantity
+                    stored_delta = df.at[idx, "entry_delta"] if "entry_delta" in df.columns else ""
+                    delta = 0.50  # ATM fallback
+                    if stored_delta != "" and pd.notna(stored_delta):
+                        try:
+                            delta = float(stored_delta)
+                        except Exception:
+                            pass
+
+                    qty = float(df.at[idx, "quantity"] or 1)
+                    underlying_move = entry * (pnl_pct / 100)  # $ move in underlying
+                    pnl_dollars = underlying_move * delta * 100 * qty
                 else:
                     pnl_dollars = total_cost * pnl_pct / 100
+
                 df.at[idx, "pnl_dollars"] = round(pnl_dollars, 2)
             except Exception:
                 pass
@@ -614,6 +707,22 @@ def generate_weekly_report() -> str:
                 "scoring formula needs recalibration before scaling.",
             ]
 
+    # Confidence calibration (only if 30+ picks)
+    cal = calibrate_confidence_scores(min_picks=30)
+    if cal.get("calibrated"):
+        lines += ["", "## Confidence Calibration"]
+        lines.append(f"_n={cal['n_evaluated']} evaluated picks_")
+        for label, d in cal["buckets"].items():
+            sign = "+" if d["delta"] >= 0 else ""
+            lines.append(
+                f"- **{label}** stated {d['stated_mid']}% → actual {d['actual_wr']}% "
+                f"({sign}{d['delta']}pp, adjust {'+' if d['adjust'] >= 0 else ''}{d['adjust']}pp)"
+            )
+        lines += ["", f"**{cal['recommendation']}**"]
+    elif not cal.get("calibrated") and cal.get("n_evaluated", 0) > 0:
+        needed = 30 - cal["n_evaluated"]
+        lines += ["", f"_Calibration unlocks in {needed} more evaluated picks (need 30)._"]
+
     lines += ["", "---", "_Auto-generated by `generate_weekly_report()`_"]
     report = "\n".join(lines)
 
@@ -632,3 +741,90 @@ def generate_weekly_report() -> str:
         logger.warning("Could not save weekly report: %s", e)
 
     return report_file
+
+
+def calibrate_confidence_scores(min_picks: int = 30) -> dict:
+    """Compare stated confidence vs actual win rate per bucket.
+
+    Returns a calibration dict with the over/under-confidence per bucket
+    and recommended score adjustments. Requires `min_picks` evaluated rows
+    (default 30) to be meaningful — returns empty dict below that threshold.
+
+    Example output:
+        {
+          "calibrated": True,
+          "n_evaluated": 42,
+          "buckets": {
+            "90-100": {"stated_mid": 95, "actual_wr": 72.0, "delta": -23, "adjust": -20},
+            "80-89":  {"stated_mid": 84, "actual_wr": 61.0, "delta": -23, "adjust": -20},
+            "70-79":  {"stated_mid": 74, "actual_wr": 55.0, "delta": -19, "adjust": -15},
+            "60-69":  {"stated_mid": 64, "actual_wr": 50.0, "delta": -14, "adjust": -10},
+            "<60":    {"stated_mid": 50, "actual_wr": 43.0, "delta":  -7, "adjust":  -5},
+          },
+          "overall_bias": -16,   # avg over-confidence in pp
+          "recommendation": "Reduce all confidence scores by ~15pp across the board",
+        }
+    """
+    import pandas as pd
+
+    if not os.path.exists(JOURNAL_FILE):
+        return {"calibrated": False, "reason": "no journal file"}
+
+    df = pd.read_csv(JOURNAL_FILE)
+    evaluated = df[df["outcome"].isin(["WIN", "LOSS"])]
+
+    if len(evaluated) < min_picks:
+        return {
+            "calibrated": False,
+            "reason": f"only {len(evaluated)} evaluated picks, need {min_picks}",
+            "n_evaluated": len(evaluated),
+        }
+
+    BUCKETS = [
+        ("90-100", 90, 101, 95),
+        ("80-89",  80, 90,  84),
+        ("70-79",  70, 80,  74),
+        ("60-69",  60, 70,  64),
+        ("<60",     0, 60,  50),
+    ]
+
+    result_buckets = {}
+    deltas = []
+
+    for label, lo, hi, mid in BUCKETS:
+        sub = evaluated[(evaluated["confidence"] >= lo) & (evaluated["confidence"] < hi)]
+        if len(sub) == 0:
+            continue
+        wins = len(sub[sub["outcome"] == "WIN"])
+        actual_wr = round(wins / len(sub) * 100, 1)
+        delta = round(actual_wr - mid, 1)       # negative = over-confident
+        adjust = round(delta / 5) * 5            # round to nearest 5pp
+
+        result_buckets[label] = {
+            "stated_mid": mid,
+            "actual_wr": actual_wr,
+            "n": len(sub),
+            "delta": delta,
+            "adjust": adjust,
+        }
+        deltas.append(delta)
+
+    if not deltas:
+        return {"calibrated": False, "reason": "no evaluated picks in any bucket"}
+
+    overall_bias = round(sum(deltas) / len(deltas), 1)
+
+    if overall_bias < -10:
+        rec = f"Reduce all confidence scores by ~{abs(int(overall_bias))}pp — you're systematically over-confident."
+    elif overall_bias > 10:
+        rec = f"Increase all confidence scores by ~{int(overall_bias)}pp — your instincts are under-stated."
+    else:
+        rec = "Calibration is within ±10pp — scoring formula is reasonably accurate."
+
+    return {
+        "calibrated": True,
+        "n_evaluated": len(evaluated),
+        "buckets": result_buckets,
+        "overall_bias": overall_bias,
+        "recommendation": rec,
+    }
